@@ -23,7 +23,7 @@ chmod +x /usr/local/bin/docker-compose
 您应该已经运行了:
 
 ```bash
-docker run -v $(pwd)/embykeeper:/app --rm -it --net=host embykeeper/embykeeper -i
+docker run -v $(pwd)/embykeeper:/app --rm -it --net=host ghcr.io/emby-keeper/embykeeper -i
 ```
 
 您需要新建一个文件 `docker-compose.yml`, 此时您的目录结构如下:
@@ -43,7 +43,7 @@ version: '3'
 services:
   embykeeper:
     container_name: embykeeper
-    image: embykeeper/embykeeper
+    image: ghcr.io/emby-keeper/embykeeper
     restart: unless-stopped
     volumes:
       - ./embykeeper:/app
@@ -108,7 +108,7 @@ version: '3'
 services:
   embykeeper:
     container_name: embykeeper
-    image: embykeeper/embykeeper
+    image: ghcr.io/emby-keeper/embykeeper
     restart: unless-stopped
     volumes:
       - ./embykeeper:/app
@@ -142,7 +142,7 @@ version: '3'
 services:
   embykeeper:
     container_name: embykeeper
-    image: embykeeper/embykeeper:v1.1.1
+    image: ghcr.io/emby-keeper/embykeeper:v1.1.1
     ....
 ```
 
@@ -159,7 +159,7 @@ version: '3'
 services:
   embykeeper:
     container_name: embykeeper
-    image: embykeeper/embykeeper
+    image: ghcr.io/emby-keeper/embykeeper
     command: '-e'
     restart: unless-stopped
     volumes:
@@ -180,7 +180,7 @@ version: '3'
 services:
   embykeeper:
     container_name: embykeeper
-    image: embykeeper/embykeeper:main-dev
+    image: ghcr.io/emby-keeper/embykeeper:main-dev
     restart: unless-stopped
     volumes:
       - ./embykeeper:/app
@@ -228,7 +228,7 @@ version: '3'
 services:
   embykeeper:
     container_name: embykeeper
-    image: embykeeper/embykeeper
+    image: ghcr.io/emby-keeper/embykeeper
     restart: unless-stopped
     environment:
       - EK_WEBPASS=123456

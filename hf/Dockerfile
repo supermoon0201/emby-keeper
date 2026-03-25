@@ -1,1 +1,1 @@
-FROM embykeeper/embykeeper:v7.6.1
+FROM ghcr.io/emby-keeper/embykeeper:v7.6.1
