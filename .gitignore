@@ -333,3 +333,5 @@ dist
 # Vitepress
 docs/.vitepress/dist
 docs/.vitepress/cache
+.ace-tool/
+.serena

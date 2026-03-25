@@ -629,13 +629,11 @@ class Emby:
             t = time
 
             last_report_t = t
-            progress_errors = 0
+            consecutive_progress_errors = 0
             report_interval = 5  # Start with 5 seconds
             report_count = 0
             max_interval = 300  # 5 minutes in seconds
             while t > 0:
-                if progress_errors > 12:
-                    raise EmbyPlayError("播放状态设定错误次数过多")
                 if last_report_t and last_report_t - t > report_interval:
                     self.log.info(f'正在播放: "{truncate_str(iname, 10)}" (还剩 {t:.0f} 秒).')
                     last_report_t = t
@@ -660,7 +658,11 @@ class Emby:
                     )
                 except Exception as e:
                     self.log.debug(f"播放状态设定错误: {e}")
-                    progress_errors += 1
+                    consecutive_progress_errors += 1
+                    if consecutive_progress_errors > 12:
+                        raise EmbyPlayError("播放状态设定错误次数过多")
+                else:
+                    consecutive_progress_errors = 0
             await asyncio.sleep(random.uniform(1, 3))
         finally:
             Emby.playing_count -= 1
