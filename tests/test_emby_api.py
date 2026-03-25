@@ -71,6 +71,8 @@ def install_play_stubs(monkeypatch, emby, should_fail_progress_call):
             if should_fail_progress_call(progress_calls):
                 raise EmbyConnectError(f"transient-{progress_calls}")
             return FakeResponse()
+        if path == "/Sessions/Playing/Stopped":
+            return FakeResponse()
         raise AssertionError(f"Unexpected request: {method} {path}")
 
     monkeypatch.setattr(api_module.asyncio, "sleep", fast_sleep)
@@ -104,3 +106,84 @@ def test_play_still_fails_after_too_many_consecutive_progress_errors(monkeypatch
         asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=270))
 
     assert get_progress_calls() == 13
+
+
+def test_play_uses_emby_timeupdate_event_name(monkeypatch):
+    emby = build_emby()
+    progress_event_names = []
+
+    async def fast_sleep(_seconds):
+        return None
+
+    async def fake_request(method, path, **kwargs):
+        if path.endswith("/AdditionalParts"):
+            return FakeResponse()
+        if path.startswith("/Items/") and path.endswith("/PlaybackInfo"):
+            return FakeResponse(
+                {
+                    "PlaySessionId": "session-id",
+                    "MediaSources": [{"Id": "media-source", "DirectStreamUrl": "/stream"}],
+                }
+            )
+        if path == "/Sessions/Playing":
+            return FakeResponse()
+        if path == "/Sessions/Playing/Progress":
+            payload = kwargs["json"]
+            if payload.get("NowPlayingQueue") == []:
+                return FakeResponse()
+
+            progress_event_names.append(payload.get("EventName"))
+            if payload.get("EventName") != "TimeUpdate":
+                raise EmbyConnectError(f"unexpected-event-name-{payload.get('EventName')}")
+            return FakeResponse()
+        if path == "/Sessions/Playing/Stopped":
+            return FakeResponse()
+        raise AssertionError(f"Unexpected request: {method} {path}")
+
+    monkeypatch.setattr(api_module.asyncio, "sleep", fast_sleep)
+    monkeypatch.setattr(api_module.asyncio, "create_task", lambda coro: DummyStreamTask(coro))
+    monkeypatch.setattr(api_module.random, "uniform", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(emby, "_request", fake_request)
+
+    assert asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=20)) is True
+    assert progress_event_names == ["TimeUpdate", "TimeUpdate"]
+
+
+def test_play_reports_stop_via_stopped_endpoint(monkeypatch):
+    emby = build_emby()
+    stopped_calls = 0
+
+    async def fast_sleep(_seconds):
+        return None
+
+    async def fake_request(method, path, **kwargs):
+        nonlocal stopped_calls
+
+        if path.endswith("/AdditionalParts"):
+            return FakeResponse()
+        if path.startswith("/Items/") and path.endswith("/PlaybackInfo"):
+            return FakeResponse(
+                {
+                    "PlaySessionId": "session-id",
+                    "MediaSources": [{"Id": "media-source", "DirectStreamUrl": "/stream"}],
+                }
+            )
+        if path == "/Sessions/Playing":
+            return FakeResponse()
+        if path == "/Sessions/Playing/Progress":
+            payload = kwargs["json"]
+            if payload.get("NowPlayingQueue") == []:
+                raise EmbyConnectError("expected-stopped-endpoint")
+            return FakeResponse()
+        if path == "/Sessions/Playing/Stopped":
+            stopped_calls += 1
+            return FakeResponse()
+        raise AssertionError(f"Unexpected request: {method} {path}")
+
+    monkeypatch.setattr(api_module.asyncio, "sleep", fast_sleep)
+    monkeypatch.setattr(api_module.asyncio, "create_task", lambda coro: DummyStreamTask(coro))
+    monkeypatch.setattr(api_module.random, "uniform", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(emby, "_request", fake_request)
+
+    assert asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=20)) is True
+    assert stopped_calls == 1

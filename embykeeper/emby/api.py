@@ -555,7 +555,7 @@ class Emby:
                 "PlaySessionId": play_session_id,
             }
             if update:
-                data["EventName"] = "timeupdate"
+                data["EventName"] = "TimeUpdate"
             if stop:
                 queue = []
             else:
@@ -680,7 +680,7 @@ class Emby:
             final_tick = int((time * final_percentage) // 10 * 10 * 10000000)
             await self._request(
                 method="POST",
-                path="/Sessions/Playing/Progress",
+                path="/Sessions/Playing/Stopped",
                 json=get_playing_data(final_tick, stop=True),
             )
             self.log.info(f"播放完成, 共 {time:.0f} 秒.")
