@@ -218,7 +218,8 @@ class Emby:
             "Version": self.env.client_version,
         }
         auth_header = ",".join([f"{k}={quote(str(v))}" for k, v in auth_headers.items()])
-        full_auth_header = f'MediaBrowser Token={self.token or ""},Emby UserId={self.run_id},{auth_header}'
+        auth_user_id = self.user_id or self.run_id
+        full_auth_header = f'MediaBrowser Token={self.token or ""},Emby UserId={auth_user_id},{auth_header}'
         headers["User-Agent"] = self.useragent or self.env.useragent
         headers["Accept-Language"] = "zh-CN,zh-Hans;q=0.9"
         headers["Content-Type"] = "application/json"

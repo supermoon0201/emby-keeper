@@ -3,7 +3,7 @@ import asyncio
 import embykeeper.emby.api as api_module
 import pytest
 
-from embykeeper.emby.api import Emby, EmbyConnectError, EmbyPlayError
+from embykeeper.emby.api import Emby, EmbyConnectError, EmbyEnv, EmbyPlayError
 from embykeeper.schema import EmbyAccount
 
 
@@ -41,6 +41,23 @@ def build_emby():
     emby._token = "token"
     emby._user_id = "user-id"
     return emby
+
+
+def test_build_headers_uses_logged_in_user_id_for_emby_authorization():
+    emby = build_emby()
+    emby.run_id = "RUN-ID"
+    emby._env = EmbyEnv(
+        client="Fileball",
+        device="Device",
+        device_id="device-id",
+        client_version="1.3.30",
+        useragent="Fileball/1.3.30",
+    )
+
+    headers = emby.build_headers()
+
+    assert "Emby UserId=user-id" in headers["X-Emby-Authorization"]
+    assert "Emby UserId=RUN-ID" not in headers["X-Emby-Authorization"]
 
 
 def install_play_stubs(monkeypatch, emby, should_fail_progress_call):
