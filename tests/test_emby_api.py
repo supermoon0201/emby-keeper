@@ -8,8 +8,11 @@ from embykeeper.schema import EmbyAccount
 
 
 class FakeResponse:
-    def __init__(self, payload=None):
+    def __init__(self, payload=None, status_code=200, text="", ok=True):
         self._payload = payload or {}
+        self.status_code = status_code
+        self.text = text
+        self.ok = ok
 
     def json(self):
         return self._payload
@@ -119,10 +122,23 @@ def test_play_still_fails_after_too_many_consecutive_progress_errors(monkeypatch
         should_fail_progress_call=lambda call: call <= 13,
     )
 
-    with pytest.raises(EmbyPlayError, match="播放状态设定错误次数过多"):
-        asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=270))
+    assert asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=270)) is True
 
-    assert get_progress_calls() == 13
+    assert get_progress_calls() == 4
+
+
+def test_describe_response_truncates_and_normalizes_body():
+    emby = build_emby()
+    resp = FakeResponse(text="  line1\nline2  ", ok=False)
+
+    assert emby._describe_response(resp, limit=20) == "响应内容: line1 line2"
+
+
+def test_describe_response_reports_empty_body():
+    emby = build_emby()
+    resp = FakeResponse(text="", ok=False)
+
+    assert emby._describe_response(resp) == "响应内容为空"
 
 
 def test_play_uses_emby_timeupdate_event_name(monkeypatch):

@@ -77,6 +77,20 @@ class Emby:
     def hostname(self):
         return self.a.url.host
 
+    @staticmethod
+    def _describe_response(resp: Response, limit: int = 200) -> str:
+        try:
+            body = (resp.text or "").strip()
+        except Exception:
+            body = ""
+
+        if body:
+            body = re.sub(r"\s+", " ", body)
+            if len(body) > limit:
+                body = f"{body[:limit]}..."
+            return f"响应内容: {body}"
+        return "响应内容为空"
+
     @property
     def token(self):
         if not self._token:
@@ -273,7 +287,10 @@ class Emby:
                         await self.use_cfsolver()
                         continue
                     elif not resp.ok and not _login:
-                        raise EmbyStatusError(f"访问失败: 异常 HTTP 代码 {resp.status_code} (URL = {url})")
+                        raise EmbyStatusError(
+                            f"访问失败: 异常 HTTP 代码 {resp.status_code} (URL = {url}, "
+                            f"{self._describe_response(resp)})"
+                        )
                     else:
                         return resp
             except RequestsError as e:
@@ -631,6 +648,8 @@ class Emby:
 
             last_report_t = t
             consecutive_progress_errors = 0
+            last_progress_error = None
+            progress_reporting_enabled = True
             report_interval = 5  # Start with 5 seconds
             report_count = 0
             max_interval = 300  # 5 minutes in seconds
@@ -646,6 +665,8 @@ class Emby:
                 st = min(10, t)
                 await asyncio.sleep(st)
                 t -= st
+                if not progress_reporting_enabled:
+                    continue
                 tick = int((time - t) * 10000000)
                 payload = get_playing_data(tick, update=True)
                 try:
@@ -658,12 +679,24 @@ class Emby:
                         10,
                     )
                 except Exception as e:
-                    self.log.debug(f"播放状态设定错误: {e}")
+                    last_progress_error = str(e)
                     consecutive_progress_errors += 1
-                    if consecutive_progress_errors > 12:
-                        raise EmbyPlayError("播放状态设定错误次数过多")
+                    if consecutive_progress_errors in (1, 3, 6, 12):
+                        self.log.warning(
+                            "播放状态设定错误"
+                            f" ({consecutive_progress_errors}/12): {last_progress_error}"
+                        )
+                    else:
+                        self.log.debug(f"播放状态设定错误: {e}")
+                    if consecutive_progress_errors > 3:
+                        progress_reporting_enabled = False
+                        self.log.warning(
+                            "播放进度上报连续失败, 将继续模拟播放并在结束时仅发送停止事件: "
+                            f"{last_progress_error}"
+                        )
                 else:
                     consecutive_progress_errors = 0
+                    last_progress_error = None
             await asyncio.sleep(random.uniform(1, 3))
         finally:
             Emby.playing_count -= 1
