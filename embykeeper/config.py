@@ -179,6 +179,9 @@ class ConfigManager(ProxyBase):
         c.add(comment("最大可同时进行的站点数:"))
         c["concurrency"] = default_config.emby.concurrency
         c.add(nl())
+        c.add(comment("每个 Emby 请求的超时时间 (秒), 对慢站点可适当调大:"))
+        c["timeout"] = default_config.emby.timeout
+        c.add(nl())
         c.add(comment("=" * 80))
         c.add(comment("Emby 账号, 您可以重复该片段多次以增加多个账号."))
         c.add(comment(f"详见: https://emby-keeper.github.io/guide/配置文件#emby-account-子项"))
@@ -203,6 +206,8 @@ class ConfigManager(ProxyBase):
         a.add(comment(item({"interval_days": default_config.emby.interval_days}).as_string()))
         a.add(comment("每次进行保活的当日时间范围, 默认使用全局设置 emby.time_range:"))
         a.add(comment(item({"time_range": default_config.emby.time_range}).as_string()))
+        a.add(comment("该账号的请求超时时间 (秒), 默认使用全局设置 emby.timeout:"))
+        a.add(comment(item({"timeout": default_config.emby.timeout}).as_string()))
         a.add(comment("无法获取视频长度时, 依然允许播放 (默认最大播放 10 分钟左右, 可能播放超出实际长度):"))
         a.add(comment(item({"allow_stream": True}).as_string()))
         a.add(comment("取消注释以不使用配置文件定义的代理进行连接"))

@@ -118,6 +118,7 @@ class MediaServerBaseConfig(ConfigModel):
     interval_days: Optional[UseStr] = DEFAULT_EMBY_INTERVAL_DAYS
     concurrency: Optional[int] = 1
     retries: Optional[int] = 5
+    timeout: Optional[int] = 10
 
 
 class EmbyAccount(ConfigModel):
@@ -135,6 +136,7 @@ class EmbyAccount(ConfigModel):
     allow_stream: Optional[bool] = False
     cf_challenge: Optional[bool] = True
     use_proxy: Optional[bool] = True
+    timeout: Optional[int] = None
     play_id: Optional[str] = None
     enabled: Optional[bool] = True
 

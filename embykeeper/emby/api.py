@@ -248,12 +248,14 @@ class Emby:
         if self.cf_clearance:
             cookies["cf_clearance"] = self.cf_clearance
 
+        timeout = self.a.timeout or config.emby.timeout or 10
+
         return AsyncSession(
             verify=False,
             headers=self.build_headers(),
             cookies=cookies,
             proxy=get_proxy_str(self.proxy, curl=True),
-            timeout=10.0,
+            timeout=float(timeout),
             impersonate="chrome",
             allow_redirects=True,
             default_headers=False,
