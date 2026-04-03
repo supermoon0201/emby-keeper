@@ -92,14 +92,12 @@ async def start_notifier():
             stream_log,
             format=_formatter,
             filter=_filter_log,
-            enqueue=True,
         )
         stream_msg = AppriseStream(uri=notifier.apprise_uri)
         handler_msg_id = logger.add(
             stream_msg,
             format=_formatter,
             filter=_filter_msg,
-            enqueue=True,
         )
         if not change_handle_notifier:
             change_handle_notifier = config.on_change("notifier", _handle_config_change)

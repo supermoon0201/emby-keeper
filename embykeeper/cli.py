@@ -521,6 +521,7 @@ async def main(
             subsonic_man = SubsonicManager()
 
         pool = AsyncTaskPool()
+        streams = None
 
         if registrar_bot:
             logger.info(f"开始快速注册 @{registrar_bot}")
@@ -574,7 +575,9 @@ async def main(
                     logger.debug(f"任务 {t.get_name()} 成功结束.")
         finally:
             if streams:
-                await asyncio.gather(*[stream.join() for stream in streams])
+                from .notify import _stop_notifier
+
+                await _stop_notifier()
     finally:
         from .runinfo import RunContext
 
