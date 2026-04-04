@@ -115,13 +115,14 @@ def test_request_preserves_base_path_in_account_url(monkeypatch):
     assert requested_urls == [("GET", "https://example.com:443/base/path/Users/Me")]
 
 
-def test_request_auto_prefers_emby_base_path_when_available(monkeypatch):
+def test_request_auto_prefers_emby_base_path_when_workaround_enabled(monkeypatch):
     emby = Emby(
         EmbyAccount(
-            url="http://emby-prefers.example.com",
+            url="http://example.com",
             username="user",
             password="pass",
             use_proxy=False,
+            stream_workaround=True,
         )
     )
     requested_urls = []
@@ -144,7 +145,7 @@ def test_request_auto_prefers_emby_base_path_when_available(monkeypatch):
 
         async def request(self, method, url, **kwargs):
             requested_urls.append((method, url))
-            if url == "http://emby-prefers.example.com:80/emby/System/Info/Public":
+            if url == "http://example.com:80/emby/System/Info/Public":
                 return FakeResponse(status_code=200, ok=True)
             return FakeResponse(status_code=200, ok=True)
 
@@ -154,9 +155,31 @@ def test_request_auto_prefers_emby_base_path_when_available(monkeypatch):
     asyncio.run(emby._request("GET", "/Users/Me"))
 
     assert requested_urls == [
-        ("GET", "http://emby-prefers.example.com:80/emby/System/Info/Public"),
-        ("GET", "http://emby-prefers.example.com:80/emby/Users/Me"),
+        ("GET", "http://example.com:80/emby/System/Info/Public"),
+        ("GET", "http://example.com:80/emby/Users/Me"),
     ]
+
+
+def test_request_does_not_probe_emby_base_path_for_normal_host(monkeypatch):
+    emby = build_emby()
+    requested_urls = []
+
+    class DummySession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, **kwargs):
+            requested_urls.append((method, url))
+            return FakeResponse(status_code=200, ok=True)
+
+    monkeypatch.setattr(emby, "_get_session", lambda: DummySession())
+
+    asyncio.run(emby._request("GET", "/Users/Me"))
+
+    assert requested_urls == [("GET", "http://example.com:80/Users/Me")]
 
 
 def install_play_stubs(monkeypatch, emby, should_fail_progress_call):
@@ -303,6 +326,21 @@ def test_stream_request_uses_account_user_agent_and_icy_metadata(monkeypatch):
     assert headers["User-Agent"] == "SenPlayer/5.8.7"
     assert headers["Icy-MetaData"] == "1"
     assert "X-Playback-Session-Id" not in headers
+
+
+def test_external_stream_workaround_uses_smaller_chunk_limits():
+    emby = Emby(
+        EmbyAccount(
+            url="http://example.com",
+            username="user",
+            password="pass",
+            use_proxy=False,
+            external_stream_workaround=True,
+        )
+    )
+
+    assert emby.use_external_stream_workaround is True
+    assert emby.use_special_stream_workaround is False
 
 
 def test_describe_response_truncates_and_normalizes_body():

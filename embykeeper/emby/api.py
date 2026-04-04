@@ -80,6 +80,14 @@ class Emby:
     def hostname(self):
         return self.a.url.host
 
+    @property
+    def use_special_stream_workaround(self):
+        return bool(self.a.stream_workaround)
+
+    @property
+    def use_external_stream_workaround(self):
+        return bool(self.a.external_stream_workaround)
+
     @staticmethod
     def _describe_response(resp: Response, limit: int = 200) -> str:
         try:
@@ -281,6 +289,10 @@ class Emby:
         configured_base_path = (self.a.url.path or "").rstrip("/")
         if configured_base_path:
             self._base_path = configured_base_path
+            return self._base_path
+
+        if not self.use_special_stream_workaround:
+            self._base_path = ""
             return self._base_path
 
         cache_key = f"emby.basepath.{self.hostname}"
@@ -598,6 +610,38 @@ class Emby:
             length = 0
             last_err_time = datetime.now()
             while True:
+                if not self.use_special_stream_workaround:
+                    resp = await self._request(
+                        method="GET",
+                        path=url,
+                        stream=True,
+                        max_recv_speed=1024,
+                        timeout=None,
+                        headers={
+                            "Range": f"bytes={length}-",
+                            "User-Agent": self.useragent or self.env.useragent,
+                            "Icy-MetaData": "1",
+                        },
+                    )
+                    try:
+                        async for i in resp.aiter_content(chunk_size=1024):
+                            chunk_length = len(i)
+                            length += chunk_length
+                            del i
+                            await asyncio.sleep(random.random())
+                            if random.random() < 0.01:
+                                continue
+                    except RequestsError:
+                        if (datetime.now() - last_err_time).total_seconds() > 5:
+                            self.log.debug("流媒体文件访问错误, 正在重试.")
+                            last_err_time = datetime.now()
+                            continue
+                        else:
+                            raise
+                    finally:
+                        await resp.aclose()
+                    continue
+
                 stream_url = await self._build_url(url)
                 stream_headers = {
                     "Range": f"bytes={length}-",
@@ -624,9 +668,14 @@ class Emby:
                     parsed_original = urlparse(stream_url)
                     parsed_redirect = urlparse(redirect_url)
                     if parsed_redirect.netloc and parsed_redirect.netloc != parsed_original.netloc:
-                        # External object storage URLs are more stable with small ranged reads.
-                        max_bytes_per_request = min(max_bytes_per_request, 2 * 1024 * 1024)
-                        max_request_seconds = min(max_request_seconds, 5)
+                        if self.use_external_stream_workaround:
+                            # For unstable object storage streams, keep each ranged request short.
+                            max_bytes_per_request = min(max_bytes_per_request, 256 * 1024)
+                            max_request_seconds = min(max_request_seconds, 2)
+                        elif self.use_special_stream_workaround:
+                            # gy1-style redirected object storage streams benefit from smaller reads.
+                            max_bytes_per_request = min(max_bytes_per_request, 2 * 1024 * 1024)
+                            max_request_seconds = min(max_request_seconds, 5)
                         external_headers = {
                             "User-Agent": self.useragent or self.env.useragent,
                             "Accept": "*/*",
@@ -641,7 +690,6 @@ class Emby:
                             impersonate=None,
                             allow_redirects=False,
                             default_headers=False,
-                            http_version="v1",
                         )
                         resp = await external_session.request(
                             method="GET",

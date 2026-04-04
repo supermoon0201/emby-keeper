@@ -134,6 +134,8 @@ class EmbyAccount(ConfigModel):
     device_id: Optional[str] = None
     allow_multiple: Optional[bool] = True
     allow_stream: Optional[bool] = False
+    stream_workaround: Optional[bool] = False
+    external_stream_workaround: Optional[bool] = False
     cf_challenge: Optional[bool] = True
     use_proxy: Optional[bool] = True
     timeout: Optional[int] = None
