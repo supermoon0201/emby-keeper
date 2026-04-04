@@ -3,7 +3,7 @@ import asyncio
 import embykeeper.emby.api as api_module
 import pytest
 
-from embykeeper.emby.api import Emby, EmbyConnectError, EmbyEnv, EmbyPlayError
+from embykeeper.emby.api import Emby, EmbyConnectError, EmbyEnv, EmbyPlayError, EmbyStatusError
 from embykeeper.schema import EmbyAccount
 
 
@@ -17,6 +17,13 @@ class FakeResponse:
     def json(self):
         return self._payload
 
+    async def aclose(self):
+        return None
+
+    async def aiter_content(self, chunk_size=1024):
+        if False:
+            yield b""
+
 
 class DummyStreamTask:
     def __init__(self, coro):
@@ -28,6 +35,21 @@ class DummyStreamTask:
     def __await__(self):
         async def _wait():
             raise asyncio.CancelledError
+
+        return _wait().__await__()
+
+
+class FailingStreamTask:
+    def __init__(self, coro, error):
+        coro.close()
+        self.error = error
+
+    def cancel(self):
+        pass
+
+    def __await__(self):
+        async def _wait():
+            raise self.error
 
         return _wait().__await__()
 
@@ -61,6 +83,80 @@ def test_build_headers_uses_logged_in_user_id_for_emby_authorization():
 
     assert "Emby UserId=user-id" in headers["X-Emby-Authorization"]
     assert "Emby UserId=RUN-ID" not in headers["X-Emby-Authorization"]
+
+
+def test_request_preserves_base_path_in_account_url(monkeypatch):
+    emby = Emby(
+        EmbyAccount(
+            url="https://example.com/base/path",
+            username="user",
+            password="pass",
+            use_proxy=False,
+        )
+    )
+
+    requested_urls = []
+
+    class DummySession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, **kwargs):
+            requested_urls.append((method, url))
+            return FakeResponse(status_code=200, ok=True)
+
+    monkeypatch.setattr(emby, "_get_session", lambda: DummySession())
+
+    asyncio.run(emby._request("GET", "/Users/Me"))
+
+    assert requested_urls == [("GET", "https://example.com:443/base/path/Users/Me")]
+
+
+def test_request_auto_prefers_emby_base_path_when_available(monkeypatch):
+    emby = Emby(
+        EmbyAccount(
+            url="http://emby-prefers.example.com",
+            username="user",
+            password="pass",
+            use_proxy=False,
+        )
+    )
+    requested_urls = []
+
+    class DummyCache:
+        @staticmethod
+        def get(_key, default=None):
+            return default
+
+        @staticmethod
+        def set(_key, _value):
+            return None
+
+    class DummySession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, **kwargs):
+            requested_urls.append((method, url))
+            if url == "http://emby-prefers.example.com:80/emby/System/Info/Public":
+                return FakeResponse(status_code=200, ok=True)
+            return FakeResponse(status_code=200, ok=True)
+
+    monkeypatch.setattr(api_module, "cache", DummyCache())
+    monkeypatch.setattr(emby, "_get_session", lambda: DummySession())
+
+    asyncio.run(emby._request("GET", "/Users/Me"))
+
+    assert requested_urls == [
+        ("GET", "http://emby-prefers.example.com:80/emby/System/Info/Public"),
+        ("GET", "http://emby-prefers.example.com:80/emby/Users/Me"),
+    ]
 
 
 def install_play_stubs(monkeypatch, emby, should_fail_progress_call):
@@ -122,9 +218,91 @@ def test_play_still_fails_after_too_many_consecutive_progress_errors(monkeypatch
         should_fail_progress_call=lambda call: call <= 13,
     )
 
-    assert asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=270)) is True
+    with pytest.raises(EmbyPlayError, match="播放进度上报连续失败"):
+        asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=270))
 
     assert get_progress_calls() == 4
+
+
+def test_play_fails_when_stream_access_breaks_after_progress_fallback(monkeypatch):
+    emby = build_emby()
+
+    async def fast_sleep(_seconds):
+        return None
+
+    async def fake_request(method, path, **kwargs):
+        if path.endswith("/AdditionalParts"):
+            return FakeResponse()
+        if path.startswith("/Items/") and path.endswith("/PlaybackInfo"):
+            return FakeResponse(
+                {
+                    "PlaySessionId": "session-id",
+                    "MediaSources": [{"Id": "media-source", "DirectStreamUrl": "/stream"}],
+                }
+            )
+        if path == "/Sessions/Playing":
+            return FakeResponse()
+        if path == "/Sessions/Playing/Progress":
+            payload = kwargs["json"]
+            if payload.get("NowPlayingQueue") == []:
+                return FakeResponse()
+            raise EmbyConnectError("progress-down")
+        if path == "/Sessions/Playing/Stopped":
+            return FakeResponse()
+        raise AssertionError(f"Unexpected request: {method} {path}")
+
+    monkeypatch.setattr(api_module.asyncio, "sleep", fast_sleep)
+    monkeypatch.setattr(
+        api_module.asyncio,
+        "create_task",
+        lambda coro: FailingStreamTask(coro, EmbyStatusError("stream-403")),
+    )
+    monkeypatch.setattr(api_module.random, "uniform", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(emby, "_request", fake_request)
+
+    with pytest.raises(EmbyPlayError, match="播放进度上报连续失败"):
+        asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=40))
+
+
+def test_resolve_playable_item_expands_series_children(monkeypatch):
+    emby = build_emby()
+
+    async def fake_get_item(iid, **kwargs):
+        assert iid == "series-id"
+        return {"Id": iid, "Name": "Series", "Type": "Series"}
+
+    async def fake_get_folder_items(parent_id, **kwargs):
+        assert parent_id == "series-id"
+        return [{"Id": "episode-id", "Name": "Episode 1", "MediaType": "Video", "RunTimeTicks": 600000000}]
+
+    monkeypatch.setattr(emby, "get_item", fake_get_item)
+    monkeypatch.setattr(emby, "get_folder_items", fake_get_folder_items)
+
+    playable = asyncio.run(emby.resolve_playable_item("series-id", {"Id": "series-id", "Name": "Series"}))
+
+    assert playable["Id"] == "episode-id"
+    assert emby.items["episode-id"]["MediaType"] == "Video"
+
+
+def test_stream_request_uses_account_user_agent_and_icy_metadata(monkeypatch):
+    emby = build_emby()
+    emby.useragent = "SenPlayer/5.8.7"
+
+    async def fake_probe_base_path(_prefix):
+        return False
+
+    monkeypatch.setattr(emby, "_probe_base_path", fake_probe_base_path)
+    emby._base_path = ""
+
+    headers = {
+        "Range": "bytes=0-",
+        "User-Agent": emby.useragent or emby.env.useragent,
+        "Icy-MetaData": "1",
+    }
+
+    assert headers["User-Agent"] == "SenPlayer/5.8.7"
+    assert headers["Icy-MetaData"] == "1"
+    assert "X-Playback-Session-Id" not in headers
 
 
 def test_describe_response_truncates_and_normalizes_body():
