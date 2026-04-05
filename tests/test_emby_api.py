@@ -287,6 +287,28 @@ def test_play_fails_when_stream_access_breaks_after_progress_fallback(monkeypatc
         asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=40))
 
 
+def test_play_can_fallback_after_too_many_progress_errors_when_enabled(monkeypatch):
+    emby = Emby(
+        EmbyAccount(
+            url="http://example.com",
+            username="user",
+            password="pass",
+            use_proxy=False,
+            progress_fallback=True,
+        )
+    )
+    emby._token = "token"
+    emby._user_id = "user-id"
+    get_progress_calls = install_play_stubs(
+        monkeypatch,
+        emby,
+        should_fail_progress_call=lambda call: call <= 13,
+    )
+
+    assert asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=270)) is True
+    assert get_progress_calls() == 4
+
+
 def test_resolve_playable_item_expands_series_children(monkeypatch):
     emby = build_emby()
 
@@ -341,6 +363,120 @@ def test_external_stream_workaround_uses_smaller_chunk_limits():
 
     assert emby.use_external_stream_workaround is True
     assert emby.use_special_stream_workaround is False
+
+
+def test_build_cdn_stream_url_uses_media_source_path():
+    emby = Emby(
+        EmbyAccount(
+            url="https://emby.nebula-media.org",
+            username="user",
+            password="pass",
+            use_proxy=False,
+            stream_cdn_path=True,
+        )
+    )
+    emby._token = "token"
+
+    url = emby._build_cdn_stream_url("https://starharn.nebula-media.org/cdn?path=Nebula Media/test.mkv")
+
+    assert url.startswith("https://emby-cdn1.nebula-media.org/cdn?path=https%3A%2F%2Fstarharn.nebula-media.org")
+    assert url.endswith("&api_key=token")
+
+
+def test_update_media_source_info_prefers_later_absolute_cdn_path():
+    emby = Emby(
+        EmbyAccount(
+            url="https://emby.nebula-media.org",
+            username="user",
+            password="pass",
+            use_proxy=False,
+            stream_cdn_path=True,
+        )
+    )
+
+    media_source_id = ""
+    direct_stream_url = None
+    media_source_path = None
+
+    media_source_id, direct_stream_url, media_source_path = emby._update_media_source_info(
+        media_source_id,
+        direct_stream_url,
+        media_source_path,
+        {
+            "MediaSources": [
+                {
+                    "Id": "media-source-1",
+                    "DirectStreamUrl": "/videos/312497/original.mp4?api_key=token",
+                    "Path": None,
+                }
+            ]
+        },
+    )
+
+    media_source_id, direct_stream_url, media_source_path = emby._update_media_source_info(
+        media_source_id,
+        direct_stream_url,
+        media_source_path,
+        {
+            "MediaSources": [
+                {
+                    "Id": "media-source-2",
+                    "DirectStreamUrl": "/videos/312497/original.mp4?api_key=token",
+                    "Path": "https://starharn.nebula-media.org/cdn?path=/mnt/gdrive/test.mp4",
+                }
+            ]
+        },
+    )
+
+    assert media_source_id == "media-source-2"
+    assert direct_stream_url == "/videos/312497/original.mp4?api_key=token"
+    assert media_source_path == "https://starharn.nebula-media.org/cdn?path=/mnt/gdrive/test.mp4"
+
+
+def test_update_media_source_info_does_not_replace_absolute_cdn_path_with_local_path():
+    emby = Emby(
+        EmbyAccount(
+            url="https://emby.nebula-media.org",
+            username="user",
+            password="pass",
+            use_proxy=False,
+            stream_cdn_path=True,
+        )
+    )
+
+    media_source_id, direct_stream_url, media_source_path = emby._update_media_source_info(
+        "",
+        None,
+        None,
+        {
+            "MediaSources": [
+                {
+                    "Id": "media-source-1",
+                    "DirectStreamUrl": "/videos/312497/original.mp4?api_key=token",
+                    "Path": "https://starharn.nebula-media.org/cdn?path=/mnt/gdrive/test.mp4",
+                }
+            ]
+        },
+    )
+
+    media_source_id, direct_stream_url, media_source_path = emby._update_media_source_info(
+        media_source_id,
+        direct_stream_url,
+        media_source_path,
+        {
+            "MediaSources": [
+                {
+                    "Id": "media-source-2",
+                    "DirectStreamUrl": "/videos/312497/original.mp4?api_key=token",
+                    "Path": "/mnt/gdrive/test.mp4",
+                }
+            ]
+        },
+    )
+
+    assert media_source_id == "media-source-2"
+    assert direct_stream_url == "/videos/312497/original.mp4?api_key=token"
+    assert media_source_path == "https://starharn.nebula-media.org/cdn?path=/mnt/gdrive/test.mp4"
 
 
 def test_describe_response_truncates_and_normalizes_body():

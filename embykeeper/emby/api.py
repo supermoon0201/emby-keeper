@@ -2,11 +2,12 @@ import asyncio
 from datetime import datetime
 import random
 import string
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import quote, quote_plus, urljoin, urlparse
 import uuid
 from typing import Iterable, List, Union, Optional
 import re
 
+import httpx
 from loguru import logger
 from curl_cffi.requests import AsyncSession, Response, RequestsError
 from pydantic import BaseModel, ValidationError
@@ -70,7 +71,7 @@ class Emby:
         self.useragent = None
         self.items = {}
 
-        self.log = logger.bind(server=self.a.name or self.hostname, username=self.a.username)
+        self.log = logger.bind(server=self.a.name or self.server_label, username=self.a.username)
 
     @property
     def proxy(self):
@@ -81,12 +82,21 @@ class Emby:
         return self.a.url.host
 
     @property
+    def server_label(self):
+        path = (self.a.url.path or "").rstrip("/")
+        return f"{self.hostname}{path}" if path else self.hostname
+
+    @property
     def use_special_stream_workaround(self):
         return bool(self.a.stream_workaround)
 
     @property
     def use_external_stream_workaround(self):
         return bool(self.a.external_stream_workaround)
+
+    @property
+    def use_stream_cdn_path(self):
+        return bool(self.a.stream_cdn_path)
 
     @staticmethod
     def _describe_response(resp: Response, limit: int = 200) -> str:
@@ -271,6 +281,91 @@ class Emby:
             allow_redirects=True,
             default_headers=False,
         )
+
+    def _get_stream_timeout(self) -> httpx.Timeout:
+        return httpx.Timeout(connect=20.0, read=None, write=20.0, pool=20.0)
+
+    def _build_stream_headers(self, length: int) -> dict:
+        return {
+            "Range": f"bytes={length}-",
+            "User-Agent": self.useragent or self.env.useragent,
+            "Icy-MetaData": "1",
+        }
+
+    def _build_bounded_stream_headers(self, length: int, size: int) -> dict:
+        end = length + size - 1
+        return {
+            "Range": f"bytes={length}-{end}",
+            "User-Agent": self.useragent or self.env.useragent,
+            "Icy-MetaData": "1",
+        }
+
+    def _build_external_stream_headers(self, length: int) -> dict:
+        return {
+            "User-Agent": self.useragent or self.env.useragent,
+            "Accept": "*/*",
+            "Range": f"bytes={length}-",
+            "Connection": "close",
+            "Icy-MetaData": "1",
+        }
+
+    def _build_cdn_stream_url(self, media_source_path: str) -> str:
+        parsed = urlparse(media_source_path)
+        if not parsed.scheme or not parsed.netloc:
+            raise EmbyStatusError(f"访问失败: 无法解析媒体源 CDN 路径 (PATH = {media_source_path})")
+
+        if self.hostname.startswith("emby."):
+            cdn_host = self.hostname.replace("emby.", "emby-cdn1.", 1)
+        else:
+            cdn_host = f"emby-cdn1.{self.hostname}"
+
+        return f"https://{cdn_host}/cdn?path={quote_plus(media_source_path)}&api_key={self.token}"
+
+    def _build_cdn_stream_headers(self, length: int, size: int) -> dict:
+        end = length + size - 1
+        return {
+            "Authorization": (
+                f'MediaBrowser Client="Hills Windows", Device="DESKTOP-MKFV627", '
+                f'DeviceId="3f3a1fd2c899d30f888ef5f79103e432", Version="1.0.0", Token="{self.token}"'
+            ),
+            "User-Agent": "Hills Windows/1.0.0 (windows; 26100.ge_release.240331-1435)",
+            "Accept": "application/json, text/plain, */*",
+            "Range": f"bytes={length}-{end}",
+            "Connection": "Keep-Alive",
+            "Accept-Encoding": "gzip",
+            "Accept-Language": "zh-CN,en,*",
+            "Icy-MetaData": "1",
+        }
+
+    @staticmethod
+    def _is_absolute_url(value: Optional[str]) -> bool:
+        if not value:
+            return False
+        parsed = urlparse(value)
+        return bool(parsed.scheme and parsed.netloc)
+
+    def _update_media_source_info(
+        self,
+        media_source_id: str,
+        direct_stream_url: Optional[str],
+        media_source_path: Optional[str],
+        playback_info: dict,
+    ):
+        media_sources = playback_info.get("MediaSources") or []
+        if not media_sources:
+            return media_source_id, direct_stream_url, media_source_path
+
+        source = media_sources[0]
+        next_media_source_id = source.get("Id") or media_source_id
+        next_direct_stream_url = source.get("DirectStreamUrl") or direct_stream_url
+        next_media_source_path = source.get("Path")
+
+        if self._is_absolute_url(next_media_source_path):
+            media_source_path = next_media_source_path
+        elif not media_source_path and next_media_source_path:
+            media_source_path = next_media_source_path
+
+        return next_media_source_id, next_direct_stream_url, media_source_path
 
     async def _probe_base_path(self, prefix: str) -> bool:
         url = f"{self.a.url.scheme}://{self.a.url.host}:{self.a.url.port}{prefix}/System/Info/Public"
@@ -536,14 +631,15 @@ class Emby:
         playback_info = resp.json()
 
         play_session_id = playback_info.get("PlaySessionId", "")
-        if "MediaSources" in playback_info:
-            media_source_id = playback_info["MediaSources"][0]["Id"]
-            direct_stream_url = playback_info["MediaSources"][0].get("DirectStreamUrl", None)
-        else:
-            media_source_id = "".join(
-                random.choice(string.ascii_lowercase + string.digits) for _ in range(32)
-            )
-            direct_stream_url = None
+        media_source_id = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(32))
+        direct_stream_url = None
+        media_source_path = None
+        media_source_id, direct_stream_url, media_source_path = self._update_media_source_info(
+            media_source_id,
+            direct_stream_url,
+            media_source_path,
+            playback_info,
+        )
 
         await asyncio.sleep(random.uniform(1, 3))
 
@@ -569,6 +665,12 @@ class Emby:
                     UserID=self.user_id,
                 ),
                 json=playback_info_data,
+            )
+            media_source_id, direct_stream_url, media_source_path = self._update_media_source_info(
+                media_source_id,
+                direct_stream_url,
+                media_source_path,
+                resp.json(),
             )
 
         def get_playing_data(tick, update=False, stop=False):
@@ -610,114 +712,69 @@ class Emby:
             length = 0
             last_err_time = datetime.now()
             while True:
-                if not self.use_special_stream_workaround:
-                    resp = await self._request(
-                        method="GET",
-                        path=url,
-                        stream=True,
-                        max_recv_speed=1024,
-                        timeout=None,
-                        headers={
-                            "Range": f"bytes={length}-",
-                            "User-Agent": self.useragent or self.env.useragent,
-                            "Icy-MetaData": "1",
-                        },
-                    )
-                    try:
-                        async for i in resp.aiter_content(chunk_size=1024):
-                            chunk_length = len(i)
-                            length += chunk_length
-                            del i
-                            await asyncio.sleep(random.random())
-                            if random.random() < 0.01:
-                                continue
-                    except RequestsError:
-                        if (datetime.now() - last_err_time).total_seconds() > 5:
-                            self.log.debug("流媒体文件访问错误, 正在重试.")
-                            last_err_time = datetime.now()
-                            continue
-                        else:
-                            raise
-                    finally:
-                        await resp.aclose()
-                    continue
-
-                stream_url = await self._build_url(url)
-                stream_headers = {
-                    "Range": f"bytes={length}-",
-                    "User-Agent": self.useragent or self.env.useragent,
-                    "Icy-MetaData": "1",
-                }
-                max_bytes_per_request = self._stream_max_bytes_per_request
-                max_request_seconds = self._stream_max_request_seconds
-                async with self._get_session() as session:
-                    resp = await session.request(
-                        method="GET",
-                        url=stream_url,
-                        stream=True,
-                        max_recv_speed=1024,
-                        timeout=None,
-                        allow_redirects=False,
+                if self.use_stream_cdn_path and media_source_path:
+                    max_bytes_per_request = 16 * 1024 * 1024
+                    max_request_seconds = min(self._stream_max_request_seconds, 10)
+                    stream_url = self._build_cdn_stream_url(media_source_path)
+                    stream_headers = self._build_cdn_stream_headers(length, max_bytes_per_request)
+                else:
+                    stream_url = await self._build_url(url)
+                    stream_headers = self._build_stream_headers(length)
+                    max_bytes_per_request = self._stream_max_bytes_per_request
+                    max_request_seconds = self._stream_max_request_seconds
+                response = None
+                response_cm = None
+                client = None
+                try:
+                    client = httpx.AsyncClient(
+                        verify=False,
+                        timeout=self._get_stream_timeout(),
+                        follow_redirects=False,
+                        http2=False,
                         headers=stream_headers,
                     )
-                if resp.status_code in (301, 302, 307, 308):
-                    redirect_url = resp.headers.get("Location")
-                    await resp.aclose()
-                    if not redirect_url:
-                        raise EmbyStatusError(f"访问失败: 流媒体重定向缺少目标地址 (URL = {stream_url})")
-                    parsed_original = urlparse(stream_url)
-                    parsed_redirect = urlparse(redirect_url)
-                    if parsed_redirect.netloc and parsed_redirect.netloc != parsed_original.netloc:
-                        if self.use_external_stream_workaround:
-                            # For unstable object storage streams, keep each ranged request short.
-                            max_bytes_per_request = min(max_bytes_per_request, 256 * 1024)
-                            max_request_seconds = min(max_request_seconds, 2)
-                        elif self.use_special_stream_workaround:
-                            # gy1-style redirected object storage streams benefit from smaller reads.
-                            max_bytes_per_request = min(max_bytes_per_request, 2 * 1024 * 1024)
-                            max_request_seconds = min(max_request_seconds, 5)
-                        external_headers = {
-                            "User-Agent": self.useragent or self.env.useragent,
-                            "Accept": "*/*",
-                            "Range": f"bytes={length}-",
-                            "Connection": "close",
-                            "Icy-MetaData": "1",
-                        }
-                        external_session = AsyncSession(
+                    response_cm = client.stream("GET", stream_url)
+                    response = await response_cm.__aenter__()
+
+                    if response.status_code in (301, 302, 307, 308):
+                        redirect_url = response.headers.get("Location")
+                        parsed_original = urlparse(stream_url)
+                        await response_cm.__aexit__(None, None, None)
+                        response_cm = None
+                        await client.aclose()
+                        client = None
+                        if not redirect_url:
+                            raise EmbyStatusError(f"访问失败: 流媒体重定向缺少目标地址 (URL = {stream_url})")
+                        parsed_redirect = urlparse(redirect_url)
+                        redirect_headers = stream_headers
+                        if parsed_redirect.netloc and parsed_redirect.netloc != parsed_original.netloc:
+                            if self.use_external_stream_workaround:
+                                max_bytes_per_request = min(max_bytes_per_request, 256 * 1024)
+                                max_request_seconds = min(max_request_seconds, 2)
+                            elif self.use_special_stream_workaround:
+                                max_bytes_per_request = min(max_bytes_per_request, 2 * 1024 * 1024)
+                                max_request_seconds = min(max_request_seconds, 5)
+                            redirect_headers = self._build_external_stream_headers(length)
+
+                        client = httpx.AsyncClient(
                             verify=False,
-                            headers=external_headers,
-                            timeout=20.0,
-                            impersonate=None,
-                            allow_redirects=False,
-                            default_headers=False,
+                            timeout=self._get_stream_timeout(),
+                            follow_redirects=False,
+                            http2=False,
+                            headers=redirect_headers,
                         )
-                        resp = await external_session.request(
-                            method="GET",
-                            url=redirect_url,
-                            stream=True,
-                            max_recv_speed=1024,
-                            timeout=None,
+                        response_cm = client.stream("GET", redirect_url)
+                        response = await response_cm.__aenter__()
+
+                    if response.status_code >= 400:
+                        raise EmbyStatusError(
+                            f"访问失败: 异常 HTTP 代码 {response.status_code} (URL = {response.request.url}, "
+                            f"{self._describe_response(response)})"
                         )
-                    else:
-                        async with self._get_session() as session:
-                            resp = await session.request(
-                                method="GET",
-                                url=redirect_url,
-                                stream=True,
-                                max_recv_speed=1024,
-                                timeout=None,
-                                allow_redirects=False,
-                                headers=stream_headers,
-                            )
-                elif not resp.ok:
-                    raise EmbyStatusError(
-                        f"访问失败: 异常 HTTP 代码 {resp.status_code} (URL = {stream_url}, "
-                        f"{self._describe_response(resp)})"
-                    )
-                try:
+
                     request_started_at = datetime.now()
                     read_bytes = 0
-                    async for i in resp.aiter_content(chunk_size=1024):
+                    async for i in response.aiter_bytes(chunk_size=1024):
                         chunk_length = len(i)
                         length += chunk_length
                         read_bytes += chunk_length
@@ -731,7 +788,7 @@ class Emby:
                             break
                         if random.random() < 0.01:
                             continue
-                except RequestsError:
+                except (httpx.HTTPError, httpx.TimeoutException) as e:
                     if (datetime.now() - last_err_time).total_seconds() > 5:
                         self.log.debug("流媒体文件访问错误, 正在重试.")
                         last_err_time = datetime.now()
@@ -739,7 +796,10 @@ class Emby:
                     else:
                         raise
                 finally:
-                    await resp.aclose()
+                    if response_cm is not None:
+                        await response_cm.__aexit__(None, None, None)
+                    if client is not None:
+                        await client.aclose()
 
         stream_task = asyncio.create_task(stream())
         rt = random.uniform(5, 10)
@@ -803,7 +863,14 @@ class Emby:
                     else:
                         self.log.debug(f"播放状态设定错误: {e}")
                     if consecutive_progress_errors > 3:
-                        raise EmbyPlayError(f"播放进度上报连续失败: {last_progress_error}")
+                        if self.a.progress_fallback:
+                            progress_reporting_enabled = False
+                            self.log.warning(
+                                "播放进度上报连续失败, 将继续模拟播放并在结束时仅发送停止事件: "
+                                f"{last_progress_error}"
+                            )
+                        else:
+                            raise EmbyPlayError(f"播放进度上报连续失败: {last_progress_error}")
                 else:
                     consecutive_progress_errors = 0
                     last_progress_error = None
