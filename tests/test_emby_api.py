@@ -1,6 +1,7 @@
 import asyncio
 
 import embykeeper.emby.api as api_module
+import httpx
 import pytest
 
 from embykeeper.emby.api import Emby, EmbyConnectError, EmbyEnv, EmbyPlayError, EmbyStatusError
@@ -572,3 +573,79 @@ def test_play_reports_stop_via_stopped_endpoint(monkeypatch):
 
     assert asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=20)) is True
     assert stopped_calls == 1
+
+
+def test_play_tolerates_brief_stream_reconnect_errors(monkeypatch):
+    emby = build_emby()
+    emby._stream_max_bytes_per_request = 1
+    emby._stream_max_request_seconds = 1
+    api_module.config.set({"emby": {"timeout": 10, "retries": 4}})
+
+    original_sleep = asyncio.sleep
+    stream_attempts = {"count": 0}
+
+    class FakeStreamResponse:
+        def __init__(self, status_code=200):
+            self.status_code = status_code
+            self.headers = {}
+            self.request = type("Request", (), {"url": "http://stream.local/file"})()
+
+        async def aiter_bytes(self, chunk_size=1024):
+            yield b"x"
+
+    class FakeStreamContext:
+        def __init__(self, behavior):
+            self.behavior = behavior
+
+        async def __aenter__(self):
+            if self.behavior == "error":
+                raise httpx.ConnectError("boom")
+            return FakeStreamResponse()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def stream(self, method, url):
+            stream_attempts["count"] += 1
+            behavior = "ok"
+            if stream_attempts["count"] in (2, 3):
+                behavior = "error"
+            return FakeStreamContext(behavior)
+
+        async def aclose(self):
+            return None
+
+    async def fast_sleep(_seconds):
+        await original_sleep(0)
+
+    async def fake_request(method, path, **kwargs):
+        if path.endswith("/AdditionalParts"):
+            return FakeResponse()
+        if path.startswith("/Items/") and path.endswith("/PlaybackInfo"):
+            return FakeResponse(
+                {
+                    "PlaySessionId": "session-id",
+                    "MediaSources": [{"Id": "media-source", "DirectStreamUrl": "/stream"}],
+                }
+            )
+        if path in ("/Sessions/Playing", "/Sessions/Playing/Progress", "/Sessions/Playing/Stopped"):
+            return FakeResponse()
+        raise AssertionError(f"Unexpected request: {method} {path}")
+
+    async def fake_build_url(path):
+        await original_sleep(0)
+        return f"http://example.com{path}"
+
+    monkeypatch.setattr(api_module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(api_module.asyncio, "sleep", fast_sleep)
+    monkeypatch.setattr(api_module.random, "uniform", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(api_module.random, "random", lambda: 0)
+    monkeypatch.setattr(emby, "_request", fake_request)
+    monkeypatch.setattr(emby, "_build_url", fake_build_url)
+
+    assert asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=20)) is True
+    assert stream_attempts["count"] >= 2

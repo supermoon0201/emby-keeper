@@ -710,7 +710,7 @@ class Emby:
         async def stream():
             url = direct_stream_url or f"/Videos/{iid}/stream"
             length = 0
-            last_err_time = datetime.now()
+            consecutive_stream_errors = 0
             while True:
                 if self.use_stream_cdn_path and media_source_path:
                     max_bytes_per_request = 16 * 1024 * 1024
@@ -788,13 +788,14 @@ class Emby:
                             break
                         if random.random() < 0.01:
                             continue
+                    consecutive_stream_errors = 0
                 except (httpx.HTTPError, httpx.TimeoutException) as e:
-                    if (datetime.now() - last_err_time).total_seconds() > 5:
-                        self.log.debug("流媒体文件访问错误, 正在重试.")
-                        last_err_time = datetime.now()
-                        continue
-                    else:
+                    consecutive_stream_errors += 1
+                    if consecutive_stream_errors > 3:
                         raise
+                    self.log.debug(f"流媒体文件访问错误, 正在重试 ({consecutive_stream_errors}/3).")
+                    await asyncio.sleep(min(consecutive_stream_errors, 3))
+                    continue
                 finally:
                     if response_cm is not None:
                         await response_cm.__aexit__(None, None, None)
