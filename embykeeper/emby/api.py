@@ -337,6 +337,15 @@ class Emby:
             "Icy-MetaData": "1",
         }
 
+    def _is_external_stream_url(self, value: str) -> bool:
+        parsed = urlparse(value)
+        if not parsed.scheme or not parsed.netloc:
+            return False
+
+        configured_port = self.a.url.port or (443 if self.a.url.scheme == "https" else 80)
+        parsed_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        return parsed.hostname != self.a.url.host or parsed_port != configured_port
+
     @staticmethod
     def _is_absolute_url(value: Optional[str]) -> bool:
         if not value:
@@ -722,6 +731,14 @@ class Emby:
                     stream_headers = self._build_stream_headers(length)
                     max_bytes_per_request = self._stream_max_bytes_per_request
                     max_request_seconds = self._stream_max_request_seconds
+                    if self._is_external_stream_url(stream_url):
+                        if self.use_external_stream_workaround:
+                            max_bytes_per_request = min(max_bytes_per_request, 256 * 1024)
+                            max_request_seconds = min(max_request_seconds, 2)
+                        elif self.use_special_stream_workaround:
+                            max_bytes_per_request = min(max_bytes_per_request, 2 * 1024 * 1024)
+                            max_request_seconds = min(max_request_seconds, 5)
+                        stream_headers = self._build_external_stream_headers(length)
                 response = None
                 response_cm = None
                 client = None
@@ -1098,6 +1115,33 @@ class Emby:
         response = await self._request("GET", f"/Users/{self.user_id}")
         return response.json()
 
+    @staticmethod
+    def _get_playback_evidence(before_item: Optional[dict], after_item: Optional[dict]) -> Optional[str]:
+        before_user_data = (before_item or {}).get("UserData") or {}
+        after_user_data = (after_item or {}).get("UserData") or {}
+
+        before_play_count = before_user_data.get("PlayCount") or 0
+        after_play_count = after_user_data.get("PlayCount") or 0
+        if after_play_count > before_play_count or (before_play_count < 1 and after_play_count >= 1):
+            return f"播放次数已更新为 {after_play_count}"
+
+        before_played = bool(before_user_data.get("Played"))
+        after_played = bool(after_user_data.get("Played"))
+        if not before_played and after_played:
+            return "视频已标记为已播放"
+
+        before_last_played = before_user_data.get("LastPlayedDate")
+        after_last_played = after_user_data.get("LastPlayedDate")
+        if after_last_played and after_last_played != before_last_played:
+            return "最后播放时间已更新"
+
+        before_position_ticks = before_user_data.get("PlaybackPositionTicks") or 0
+        after_position_ticks = after_user_data.get("PlaybackPositionTicks") or 0
+        if after_position_ticks > before_position_ticks:
+            return f"播放进度已更新到 {after_position_ticks}"
+
+        return None
+
     async def mark_played(self, item_id: str) -> bool:
         """Mark an item as played."""
         response = await self._request("POST", f"/Users/{self.user_id}/PlayedItems/{item_id}")
@@ -1162,13 +1206,26 @@ class Emby:
                 self.log.debug(f"视频 ID: {iid}.")
                 while True:
                     try:
+                        before_item = await self.get_item(iid)
                         await self.play(item, time=play_time)
                         await asyncio.sleep(random.random())
                         item = await self.get_item(iid)
+                        playback_evidence = self._get_playback_evidence(before_item, item)
+                        if not playback_evidence:
+                            self.log.info("播放后未检测到播放状态变化, 正在尝试补记播放状态.")
+                            if await self.mark_played(iid):
+                                await asyncio.sleep(random.random())
+                                item = await self.get_item(iid)
+                                playback_evidence = (
+                                    self._get_playback_evidence(before_item, item)
+                                    or "已调用 PlayedItems 接口补记播放状态"
+                                )
+                        if not playback_evidence:
+                            raise EmbyPlayError("播放后未检测到播放状态变化")
                         play_count = item.get("UserData", {}).get("PlayCount", 0)
-                        if play_count < 1:
-                            raise EmbyPlayError("播放后播放数低于 1")
-                        self.log.info(f"[yellow]成功播放视频[/], 当前该视频播放 {play_count} 次.")
+                        self.log.info(
+                            f"[yellow]成功播放视频[/], {playback_evidence}, 当前该视频播放 {play_count} 次."
+                        )
                         played_videos += 1
                         played_time += play_time
                         if played_time >= req_time - 1:

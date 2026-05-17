@@ -366,6 +366,21 @@ def test_external_stream_workaround_uses_smaller_chunk_limits():
     assert emby.use_special_stream_workaround is False
 
 
+def test_is_external_stream_url_detects_absolute_external_host():
+    emby = Emby(
+        EmbyAccount(
+            url="https://gy.emby.yun:4443",
+            username="user",
+            password="pass",
+            use_proxy=False,
+        )
+    )
+
+    assert emby._is_external_stream_url("http://110.42.42.172:35902/emby/Videos/754409/stream") is True
+    assert emby._is_external_stream_url("https://gy.emby.yun:4443/emby/Videos/754409/stream") is False
+    assert emby._is_external_stream_url("/Videos/754409/stream") is False
+
+
 def test_build_cdn_stream_url_uses_media_source_path():
     emby = Emby(
         EmbyAccount(
@@ -492,6 +507,24 @@ def test_describe_response_reports_empty_body():
     resp = FakeResponse(text="", ok=False)
 
     assert emby._describe_response(resp) == "响应内容为空"
+
+
+def test_get_playback_evidence_accepts_last_played_date_change():
+    evidence = Emby._get_playback_evidence(
+        {"UserData": {"PlayCount": 0, "Played": False, "LastPlayedDate": None}},
+        {"UserData": {"PlayCount": 0, "Played": False, "LastPlayedDate": "2026-05-17T06:00:00Z"}},
+    )
+
+    assert evidence == "最后播放时间已更新"
+
+
+def test_get_playback_evidence_accepts_progress_change():
+    evidence = Emby._get_playback_evidence(
+        {"UserData": {"PlaybackPositionTicks": 0}},
+        {"UserData": {"PlaybackPositionTicks": 123456789}},
+    )
+
+    assert evidence == "播放进度已更新到 123456789"
 
 
 def test_play_uses_emby_timeupdate_event_name(monkeypatch):
@@ -649,3 +682,143 @@ def test_play_tolerates_brief_stream_reconnect_errors(monkeypatch):
 
     assert asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=20)) is True
     assert stream_attempts["count"] >= 2
+
+
+def test_play_uses_external_headers_for_absolute_direct_stream_url(monkeypatch):
+    emby = Emby(
+        EmbyAccount(
+            url="https://gy.emby.yun:4443",
+            username="user",
+            password="pass",
+            use_proxy=False,
+            external_stream_workaround=True,
+            useragent="SenPlayer/5.8.7",
+        )
+    )
+    emby._token = "token"
+    emby._user_id = "user-id"
+    emby._stream_max_bytes_per_request = 1024 * 1024
+    emby._stream_max_request_seconds = 10
+
+    captured_headers = []
+    original_sleep = asyncio.sleep
+
+    class FakeStreamResponse:
+        def __init__(self):
+            self.status_code = 200
+            self.headers = {}
+            self.request = type(
+                "Request",
+                (),
+                {"url": "http://110.42.42.172:35902/emby/Videos/754409/stream?Static=true&api_key=token"},
+            )()
+
+        async def aiter_bytes(self, chunk_size=1024):
+            yield b"x"
+
+    class FakeStreamContext:
+        async def __aenter__(self):
+            return FakeStreamResponse()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            captured_headers.append(kwargs["headers"])
+
+        def stream(self, method, url):
+            return FakeStreamContext()
+
+        async def aclose(self):
+            return None
+
+    async def fast_sleep(_seconds):
+        await original_sleep(0)
+
+    async def fake_request(method, path, **kwargs):
+        if path.endswith("/AdditionalParts"):
+            return FakeResponse()
+        if path.startswith("/Items/") and path.endswith("/PlaybackInfo"):
+            return FakeResponse(
+                {
+                    "PlaySessionId": "session-id",
+                    "MediaSources": [
+                        {
+                            "Id": "media-source",
+                            "DirectStreamUrl": "http://110.42.42.172:35902/emby/Videos/754409/stream?Static=true&api_key=token",
+                        }
+                    ],
+                }
+            )
+        if path in ("/Sessions/Playing", "/Sessions/Playing/Progress", "/Sessions/Playing/Stopped"):
+            return FakeResponse()
+        raise AssertionError(f"Unexpected request: {method} {path}")
+
+    monkeypatch.setattr(api_module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(api_module.asyncio, "sleep", fast_sleep)
+    monkeypatch.setattr(api_module.random, "uniform", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(api_module.random, "random", lambda: 0)
+    monkeypatch.setattr(emby, "_request", fake_request)
+
+    assert asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=20)) is True
+    assert captured_headers
+    assert captured_headers[0]["Accept"] == "*/*"
+    assert captured_headers[0]["Connection"] == "close"
+    assert captured_headers[0]["Range"] == "bytes=0-"
+
+
+def test_watch_marks_item_played_when_server_does_not_increment_play_count(monkeypatch):
+    emby = Emby(
+        EmbyAccount(
+            url="http://example.com",
+            username="user",
+            password="pass",
+            use_proxy=False,
+            time=20,
+        )
+    )
+    emby._token = "token"
+    emby._user_id = "user-id"
+    emby.items = {
+        "item-id": {
+            "Id": "item-id",
+            "Name": "Demo",
+            "RunTimeTicks": 600000000,
+        }
+    }
+
+    get_item_calls = {"count": 0}
+    mark_played_calls = []
+
+    async def fake_resolve_playable_item(iid, item):
+        return item
+
+    async def fake_play(item, time):
+        return True
+
+    async def fake_get_item(iid, **kwargs):
+        get_item_calls["count"] += 1
+        if get_item_calls["count"] == 1:
+            return {"Id": iid, "UserData": {"PlayCount": 0, "Played": False}}
+        if get_item_calls["count"] == 2:
+            return {"Id": iid, "UserData": {"PlayCount": 0, "Played": False}}
+        return {"Id": iid, "UserData": {"PlayCount": 1, "Played": True}}
+
+    async def fake_mark_played(iid):
+        mark_played_calls.append(iid)
+        return True
+
+    async def fast_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(api_module.asyncio, "sleep", fast_sleep)
+    monkeypatch.setattr(api_module.random, "shuffle", lambda seq: None)
+    monkeypatch.setattr(api_module.random, "random", lambda: 0)
+    monkeypatch.setattr(emby, "resolve_playable_item", fake_resolve_playable_item)
+    monkeypatch.setattr(emby, "play", fake_play)
+    monkeypatch.setattr(emby, "get_item", fake_get_item)
+    monkeypatch.setattr(emby, "mark_played", fake_mark_played)
+
+    assert asyncio.run(emby.watch()) is True
+    assert mark_played_calls == ["item-id"]
