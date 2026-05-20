@@ -806,12 +806,12 @@ class Emby:
                         if random.random() < 0.01:
                             continue
                     consecutive_stream_errors = 0
-                except (httpx.HTTPError, httpx.TimeoutException) as e:
+                except (httpx.HTTPError, httpx.TimeoutException, EmbyStatusError) as e:
                     consecutive_stream_errors += 1
                     if consecutive_stream_errors > 3:
                         raise
-                    self.log.debug(f"流媒体文件访问错误, 正在重试 ({consecutive_stream_errors}/3).")
-                    await asyncio.sleep(min(consecutive_stream_errors, 3))
+                    self.log.debug(f"流媒体文件访问错误, 正在重试 ({consecutive_stream_errors}/3): {e}")
+                    await asyncio.sleep(min(consecutive_stream_errors * 2, 10))
                     continue
                 finally:
                     if response_cm is not None:
@@ -914,8 +914,9 @@ class Emby:
                 json=get_playing_data(final_tick, stop=True),
             )
             if stream_error:
-                raise EmbyPlayError(f"模拟播放时, 访问流媒体文件失败: {stream_error}")
-            self.log.info(f"播放完成, 共 {time:.0f} 秒.")
+                self.log.info(f"播放完成 (流媒体访问有错误, 但进度上报正常), 共 {time:.0f} 秒.")
+            else:
+                self.log.info(f"播放完成, 共 {time:.0f} 秒.")
             return True
         except Exception as e:
             if isinstance(e, EmbyPlayError):
