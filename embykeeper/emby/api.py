@@ -614,16 +614,20 @@ class Emby:
             }
         }
 
-        resp = await self._request(
-            method="GET",
-            path=f"/Videos/{iid}/AdditionalParts",
-            params=dict(
-                Fields="PrimaryImageAspectRatio,UserData,CanDelete",
-                IncludeItemTypes="Playlist,BoxSet",
-                Recursive=True,
-                SortBy="SortName",
-            ),
-        )
+        try:
+            await self._request(
+                method="GET",
+                path=f"/Videos/{iid}/AdditionalParts",
+                params=dict(
+                    Fields="PrimaryImageAspectRatio,UserData,CanDelete",
+                    IncludeItemTypes="Playlist,BoxSet",
+                    Recursive=True,
+                    SortBy="SortName",
+                ),
+            )
+        except EmbyStatusError:
+            # 部分服务器不支持该接口, 忽略错误继续播放
+            pass
 
         resp = await self._request(
             method="POST",
