@@ -686,6 +686,9 @@ class Emby:
                 resp.json(),
             )
 
+        # int4 上限 (PostgreSQL)，部分服务器使用 int4 存储 ticks，超出会报 500
+        _INT4_MAX = 2_147_483_647
+
         def get_playing_data(tick, update=False, stop=False):
             data = {
                 "SubtitleOffset": 0,
@@ -695,7 +698,7 @@ class Emby:
                 "VolumeLevel": 100,
                 "PlaybackRate": 1,
                 "PlaybackStartTimeTicks": int(datetime.now().timestamp() // 10 * 10 * 10000000),
-                "PositionTicks": tick,
+                "PositionTicks": min(tick, _INT4_MAX),
                 "PlaySessionId": play_session_id,
             }
             if update:
