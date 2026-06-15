@@ -55,6 +55,7 @@ class EmbyEnv(BaseModel):
 
 class Emby:
     playing_count = 0
+    _transient_status_codes = (502, 503, 504, 520, 521, 522, 523, 524, 525)
 
     def __init__(self, account: EmbyAccount):
         self.a = account
@@ -427,7 +428,8 @@ class Emby:
                         if not await self.login():
                             raise EmbyLoginError("无法登陆到服务器")
                         continue
-                    elif resp.status_code in (502, 503, 504):
+                    elif resp.status_code in self._transient_status_codes:
+                        # 站点前置反代或 Cloudflare 可能返回瞬时错误, 这里统一按可重试处理
                         await asyncio.sleep(random.random() * 2 + 0.5)
                         continue
                     elif resp.status_code == 403 and (
@@ -1253,23 +1255,38 @@ class Emby:
                 self.log.debug(f"视频 ID: {iid}.")
                 while True:
                     try:
-                        before_item = await self.get_item(iid)
+                        try:
+                            before_item = await self.get_item(iid)
+                        except EmbyError as e:
+                            # 部分站点详情接口不稳定, 无法获取播放前状态时仍继续尝试实际播放
+                            self.log.warning(f"获取播放前视频状态失败, 将继续尝试播放: {e}")
+                            before_item = item
                         await self.play(item, time=play_time)
                         await asyncio.sleep(random.random())
-                        item = await self.get_item(iid)
+                        try:
+                            item = await self.get_item(iid)
+                        except EmbyError as e:
+                            self.log.warning(f"获取播放后视频状态失败, 将尝试补记播放状态: {e}")
+                            item = None
                         playback_evidence = self._get_playback_evidence(before_item, item)
                         if not playback_evidence:
                             self.log.info("播放后未检测到播放状态变化, 正在尝试补记播放状态.")
                             if await self.mark_played(iid):
                                 await asyncio.sleep(random.random())
-                                item = await self.get_item(iid)
-                                playback_evidence = (
-                                    self._get_playback_evidence(before_item, item)
-                                    or "已调用 PlayedItems 接口补记播放状态"
-                                )
+                                try:
+                                    item = await self.get_item(iid)
+                                except EmbyError as e:
+                                    self.log.warning(f"补记后获取视频状态失败, 将按补记成功处理: {e}")
+                                    item = None
+                                    playback_evidence = "已调用 PlayedItems 接口补记播放状态"
+                                else:
+                                    playback_evidence = (
+                                        self._get_playback_evidence(before_item, item)
+                                        or "已调用 PlayedItems 接口补记播放状态"
+                                    )
                         if not playback_evidence:
                             raise EmbyPlayError("播放后未检测到播放状态变化")
-                        play_count = item.get("UserData", {}).get("PlayCount", 0)
+                        play_count = (item or {}).get("UserData", {}).get("PlayCount", 0)
                         self.log.info(
                             f"[yellow]成功播放视频[/], {playback_evidence}, 当前该视频播放 {play_count} 次."
                         )

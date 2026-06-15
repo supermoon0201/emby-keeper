@@ -183,6 +183,33 @@ def test_request_does_not_probe_emby_base_path_for_normal_host(monkeypatch):
     assert requested_urls == [("GET", "http://example.com:80/Users/Me")]
 
 
+def test_request_retries_transient_cloudflare_status(monkeypatch):
+    emby = build_emby()
+    statuses = [522, 200]
+
+    class DummySession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, **kwargs):
+            status_code = statuses.pop(0)
+            return FakeResponse(status_code=status_code, ok=(status_code == 200))
+
+    async def fast_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(api_module.asyncio, "sleep", fast_sleep)
+    monkeypatch.setattr(emby, "_get_session", lambda: DummySession())
+
+    response = asyncio.run(emby._request("GET", "/Users/Me"))
+
+    assert response.status_code == 200
+    assert statuses == []
+
+
 def install_play_stubs(monkeypatch, emby, should_fail_progress_call):
     progress_calls = 0
 
@@ -308,6 +335,64 @@ def test_play_can_fallback_after_too_many_progress_errors_when_enabled(monkeypat
 
     assert asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=270)) is True
     assert get_progress_calls() == 4
+
+
+def test_watch_can_fallback_to_mark_played_when_item_lookup_fails(monkeypatch):
+    emby = Emby(
+        EmbyAccount(
+            url="http://example.com",
+            username="user",
+            password="pass",
+            use_proxy=False,
+            time=10,
+        )
+    )
+    emby._token = "token"
+    emby._user_id = "user-id"
+    emby.items = {
+        "item-id": {
+            "Id": "item-id",
+            "Name": "Demo",
+            "MediaType": "Video",
+            "RunTimeTicks": 600000000,
+        }
+    }
+
+    async def fast_sleep(_seconds):
+        return None
+
+    async def fake_resolve_playable_item(iid, item):
+        return item
+
+    async def fake_play(item, time):
+        return True
+
+    get_item_calls = 0
+
+    async def fake_get_item(iid, **kwargs):
+        nonlocal get_item_calls
+        get_item_calls += 1
+        if get_item_calls == 1:
+            return {
+                "Id": iid,
+                "Name": "Demo",
+                "UserData": {"PlayCount": 0, "Played": False},
+            }
+        raise EmbyStatusError("detail-down")
+
+    async def fake_mark_played(iid):
+        return True
+
+    monkeypatch.setattr(api_module.asyncio, "sleep", fast_sleep)
+    monkeypatch.setattr(api_module.random, "uniform", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(api_module.random, "shuffle", lambda _items: None)
+    monkeypatch.setattr(emby, "resolve_playable_item", fake_resolve_playable_item)
+    monkeypatch.setattr(emby, "play", fake_play)
+    monkeypatch.setattr(emby, "get_item", fake_get_item)
+    monkeypatch.setattr(emby, "mark_played", fake_mark_played)
+
+    assert asyncio.run(emby.watch()) is True
+    assert get_item_calls >= 2
 
 
 def test_resolve_playable_item_expands_series_children(monkeypatch):
