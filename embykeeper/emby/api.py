@@ -1075,17 +1075,19 @@ class Emby:
                 "EndDate",
                 "CanDelete",
             ]
+        params = {
+            "EnableImageTypes": ",".join(enable_image_types),
+            "Fields": ",".join(fields),
+            "GroupItems": group_items,
+            "Limit": limit,
+            **kw,
+        }
+        if parent_id:
+            params["ParentId"] = parent_id
         resp = await self._request(
             method="GET",
             path=f"/Users/{self.user_id}/Items/Latest",
-            params={
-                "EnableImageTypes": ",".join(enable_image_types),
-                "Fields": ",".join(fields),
-                "GroupItems": group_items,
-                "Limit": limit,
-                "ParentId": parent_id,
-                **kw,
-            },
+            params=params,
         )
         return resp.json()
 
