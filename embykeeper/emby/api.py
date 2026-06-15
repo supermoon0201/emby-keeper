@@ -931,18 +931,21 @@ class Emby:
             raise EmbyPlayError(f"由于连接错误或服务器错误无法停止播放: {e}")
 
     async def load_main_page(self):
-        views = await self._request(
-            method="GET",
-            path=f"/Users/{self.user_id}/Views",
-            params=dict(IncludeExternalContent=False),
-        )
-
         col_ids = []
-        for i in views.json().get("Items", []):
-            cid: str = i.get("Id", None)
-            type: str = i.get("CollectionType")
-            if cid and type and type.lower() in ("movies", "tvshows"):
-                col_ids.append(cid)
+        try:
+            views = await self._request(
+                method="GET",
+                path=f"/Users/{self.user_id}/Views",
+                params=dict(IncludeExternalContent=False),
+            )
+            for i in views.json().get("Items", []):
+                cid: str = i.get("Id", None)
+                type: str = i.get("CollectionType")
+                if cid and type and type.lower() in ("movies", "tvshows"):
+                    col_ids.append(cid)
+        except EmbyError as e:
+            # 部分站点首页目录接口不稳定, 此时改走继续媒体恢复和全站最新项目的兜底逻辑
+            self.log.warning(f"获取首页目录失败, 将继续尝试其他取片方式: {e}")
         await asyncio.sleep(random.uniform(0.1, 0.3))
 
         last_login_date = None
@@ -954,30 +957,55 @@ class Emby:
             self.log.warning(f"获取用户信息失败, 将继续尝试加载首页项目: {e}")
         await asyncio.sleep(random.uniform(0.1, 0.3))
 
-        await self._request(
-            method="GET",
-            path=f"/DisplayPreferences/usersettings",
-            params=dict(client="emby", userId=self.user_id),
-        )
+        try:
+            await self._request(
+                method="GET",
+                path=f"/DisplayPreferences/usersettings",
+                params=dict(client="emby", userId=self.user_id),
+            )
+        except EmbyError as e:
+            self.log.warning(f"获取显示偏好失败, 将继续尝试加载首页项目: {e}")
         await asyncio.sleep(random.uniform(0.1, 0.3))
 
-        for item in await self.get_resume_items(media_types=["Video"]):
-            try:
-                self.items[item["Id"]] = item
-            except KeyError:
-                pass
-        await asyncio.sleep(random.uniform(0.1, 0.3))
-        await self.get_resume_items(media_types=["Audio"])
-        await asyncio.sleep(random.uniform(0.1, 0.3))
-
-        for cid in col_ids[:25]:
-            items = await self.get_latest_items(parent_id=cid)
-            for item in items:
+        try:
+            for item in await self.get_resume_items(media_types=["Video"]):
                 try:
-                    iid = item["Id"]
-                    self.items[iid] = item
+                    self.items[item["Id"]] = item
                 except KeyError:
                     pass
+        except EmbyError as e:
+            self.log.warning(f"获取视频继续观看列表失败, 将继续尝试其他取片方式: {e}")
+        await asyncio.sleep(random.uniform(0.1, 0.3))
+        try:
+            await self.get_resume_items(media_types=["Audio"])
+        except EmbyError as e:
+            self.log.warning(f"获取音频继续观看列表失败, 将继续尝试其他取片方式: {e}")
+        await asyncio.sleep(random.uniform(0.1, 0.3))
+
+        if col_ids:
+            for cid in col_ids[:25]:
+                try:
+                    items = await self.get_latest_items(parent_id=cid)
+                except EmbyError as e:
+                    self.log.warning(f"获取目录最新项目失败, 将尝试其他目录: {e}")
+                    continue
+                for item in items:
+                    try:
+                        iid = item["Id"]
+                        self.items[iid] = item
+                    except KeyError:
+                        pass
+        else:
+            try:
+                # 无法获取目录时, 直接拉取全站最新视频作为兜底
+                for item in await self.get_latest_items():
+                    try:
+                        iid = item["Id"]
+                        self.items[iid] = item
+                    except KeyError:
+                        pass
+            except EmbyError as e:
+                self.log.warning(f"获取全站最新项目失败, 将尝试文件夹取片兜底: {e}")
 
         if not self.items:
             if col_ids:
@@ -985,7 +1013,11 @@ class Emby:
 
                 for col_id in col_ids[:3]:
                     await asyncio.sleep(4)
-                    items = await self.get_folder_items(parent_id=col_id)
+                    try:
+                        items = await self.get_folder_items(parent_id=col_id)
+                    except EmbyError as e:
+                        self.log.warning(f"从目录读取视频失败, 将尝试其他目录: {e}")
+                        continue
                     for item in items:
                         try:
                             iid = item["Id"]
