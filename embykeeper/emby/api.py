@@ -945,8 +945,13 @@ class Emby:
                 col_ids.append(cid)
         await asyncio.sleep(random.uniform(0.1, 0.3))
 
-        user = await self._request(method="GET", path=f"/Users/{self.user_id}")
-        last_login_date = user.json().get("LastLoginDate", None)
+        last_login_date = None
+        try:
+            # 部分站点会对用户详情接口单独挂反代或风控, 该接口失败时不应影响首页取片流程
+            user = await self._request(method="GET", path=f"/Users/{self.user_id}")
+            last_login_date = user.json().get("LastLoginDate", None)
+        except EmbyError as e:
+            self.log.warning(f"获取用户信息失败, 将继续尝试加载首页项目: {e}")
         await asyncio.sleep(random.uniform(0.1, 0.3))
 
         await self._request(
