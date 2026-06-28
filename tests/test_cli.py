@@ -22,6 +22,22 @@ def in_temp_dir(tmp_path: Path):
     os.chdir(current)
 
 
+def test_get_proxy_str_encodes_userinfo():
+    from embykeeper.schema import ProxyConfig
+    from embykeeper.utils import get_proxy_str
+
+    proxy = ProxyConfig(
+        hostname="222.128.19.51",
+        port=8327,
+        scheme="socks5",
+        username="yangle",
+        password="R$^M6@LJ4TizNc",
+    )
+
+    assert get_proxy_str(proxy, curl=True) == "socks5h://yangle:R%24%5EM6%40LJ4TizNc@222.128.19.51:8327"
+    assert get_proxy_str(proxy) == "socks5://yangle:R%24%5EM6%40LJ4TizNc@222.128.19.51:8327"
+
+
 def test_version():
     result = runner.invoke(app, ["--version"])
     assert embykeeper.__version__ in result.stdout

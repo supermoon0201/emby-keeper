@@ -7,6 +7,7 @@ import sys
 import site
 import traceback
 from typing import Any, Coroutine, Iterable, Optional, Union
+from urllib.parse import quote
 
 from loguru import logger
 
@@ -390,7 +391,10 @@ def get_proxy_str(proxy: Optional[ProxyConfig] = None, curl: bool = False):
             schema = proxy.scheme
         proxy_str = f"{schema}://"
         if proxy.username:
-            proxy_str += f"{proxy.username or ''}:{proxy.password or ''}@"
+            # 用户名和密码属于 URL userinfo，必须转义 @/:/$ 等保留字符.
+            username = quote(proxy.username or "", safe="")
+            password = quote(proxy.password or "", safe="")
+            proxy_str += f"{username}:{password}@"
         proxy_str += f"{proxy.hostname}:{proxy.port}"
     else:
         proxy_str = None
