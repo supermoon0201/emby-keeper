@@ -249,8 +249,8 @@ class EmbyManager:
                     logger.error(f"初始化失败: {e}")
                     show_exception(e, regular=False)
                     return account, False
-                if not instant:
-                    wait = random.uniform(180, 360)
+                if not instant and config.emby.random_delay:
+                    wait = random.uniform(*config.emby.random_delay_range)
                     emby.log.info(f"播放视频前随机等待 {wait:.0f} 秒.")
                     await asyncio.sleep(wait)
                 try:

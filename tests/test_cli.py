@@ -47,7 +47,26 @@ def test_version():
 def test_create_config(in_temp_dir: Path):
     result = runner.invoke(app, ["--example-config"])
     assert "这是一个配置文件范例" in result.stdout
+    assert "random_delay = true" in result.stdout
+    assert "random_delay_range = [180, 360]" in result.stdout
     assert result.exit_code == 0
+
+
+def test_emby_random_delay_config_defaults_to_enabled():
+    from embykeeper.schema import EmbyConfig
+
+    assert EmbyConfig().random_delay is True
+    assert EmbyConfig(random_delay=False).random_delay is False
+    assert EmbyConfig(random_delay_range=[10, 30]).random_delay_range == [10, 30]
+
+
+@pytest.mark.parametrize("random_delay_range", ([30, 10], [-1, 30], [10]))
+def test_emby_random_delay_range_requires_valid_range(random_delay_range):
+    from pydantic import ValidationError
+    from embykeeper.schema import EmbyConfig
+
+    with pytest.raises(ValidationError):
+        EmbyConfig(random_delay_range=random_delay_range)
 
 
 class FakeTask:

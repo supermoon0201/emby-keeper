@@ -158,7 +158,19 @@ class EmbyAccount(ConfigModel):
 
 
 class EmbyConfig(MediaServerBaseConfig):
+    random_delay: Optional[bool] = True
+    random_delay_range: List[int] = Field(default_factory=lambda: [180, 360], min_length=2, max_length=2)
     account: Optional[List[EmbyAccount]] = []
+
+    @model_validator(mode="after")
+    def validate_random_delay_range(self):
+        """校验播放前随机等待时间范围。"""
+        start, end = self.random_delay_range
+        if start < 0 or end < 0:
+            raise ValueError("random_delay_range 中的等待时间不能小于 0")
+        if start > end:
+            raise ValueError("random_delay_range 的起始时间不能大于结束时间")
+        return self
 
 
 class SubsonicAccount(ConfigModel):

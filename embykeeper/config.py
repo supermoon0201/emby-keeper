@@ -179,6 +179,12 @@ class ConfigManager(ProxyBase):
         c.add(comment("最大可同时进行的站点数:"))
         c["concurrency"] = default_config.emby.concurrency
         c.add(nl())
+        c.add(comment("是否在播放前随机等待, 设为 false 可立即开始播放:"))
+        c["random_delay"] = default_config.emby.random_delay
+        c.add(nl())
+        c.add(comment("播放前随机等待的时间范围 (秒), 仅 random_delay = true 时生效:"))
+        c["random_delay_range"] = default_config.emby.random_delay_range
+        c.add(nl())
         c.add(comment("每个 Emby 请求的超时时间 (秒), 对慢站点可适当调大:"))
         c["timeout"] = default_config.emby.timeout
         c.add(nl())

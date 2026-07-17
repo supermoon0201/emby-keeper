@@ -18,6 +18,12 @@ interval_days = "<7,12>"
 # 最大可同时进行的站点数:
 concurrency = 1
 
+# 是否在播放前随机等待, 设为 false 可立即开始播放:
+random_delay = true
+
+# 播放前随机等待的时间范围 (秒), 仅 random_delay = true 时生效:
+random_delay_range = [180, 360]
+
 # ================================================================================
 # Emby 账号, 您可以重复该片段多次以增加多个账号.
 # 详见: https://emby-keeper.github.io/guide/配置文件#emby-account-子项
