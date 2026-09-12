@@ -337,6 +337,102 @@ def test_play_can_fallback_after_too_many_progress_errors_when_enabled(monkeypat
     assert get_progress_calls() == 4
 
 
+def test_play_uses_session_id_from_final_stream_url(monkeypatch):
+    emby = build_emby()
+    playback_info_calls = 0
+    playing_payloads = []
+    progress_payloads = []
+    stopped_payloads = []
+
+    async def fast_sleep(_seconds):
+        return None
+
+    async def fake_request(method, path, **kwargs):
+        nonlocal playback_info_calls
+
+        if path.endswith("/AdditionalParts"):
+            return FakeResponse()
+        if path.startswith("/Items/") and path.endswith("/PlaybackInfo"):
+            playback_info_calls += 1
+            return FakeResponse(
+                {
+                    "PlaySessionId": f"response-session-{playback_info_calls}",
+                    "MediaSources": [
+                        {
+                            "Id": f"media-source-{playback_info_calls}",
+                            "DirectStreamUrl": (
+                                f"/stream?PlaySessionId=stream-session-{playback_info_calls}"
+                            ),
+                        }
+                    ],
+                }
+            )
+        if path == "/Sessions/Playing":
+            playing_payloads.append(kwargs["json"])
+            return FakeResponse()
+        if path == "/Sessions/Playing/Progress":
+            progress_payloads.append(kwargs["json"])
+            return FakeResponse()
+        if path == "/Sessions/Playing/Stopped":
+            stopped_payloads.append(kwargs["json"])
+            return FakeResponse()
+        raise AssertionError(f"Unexpected request: {method} {path}")
+
+    monkeypatch.setattr(api_module.asyncio, "sleep", fast_sleep)
+    monkeypatch.setattr(api_module.asyncio, "create_task", lambda coro: DummyStreamTask(coro))
+    monkeypatch.setattr(api_module.random, "uniform", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(emby, "_request", fake_request)
+
+    assert asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=20)) is True
+    assert playback_info_calls == 5
+    assert [payload["PlaySessionId"] for payload in playing_payloads] == ["stream-session-5"]
+    assert {payload["PlaySessionId"] for payload in progress_payloads} == {"stream-session-5"}
+    assert [payload["PlaySessionId"] for payload in stopped_payloads] == ["stream-session-5"]
+
+
+def test_play_reactivates_inactive_lease_once_and_retries_progress(monkeypatch):
+    emby = build_emby()
+    progress_calls = 0
+    playing_payloads = []
+
+    async def fast_sleep(_seconds):
+        return None
+
+    async def fake_request(method, path, **kwargs):
+        nonlocal progress_calls
+
+        if path.endswith("/AdditionalParts"):
+            return FakeResponse()
+        if path.startswith("/Items/") and path.endswith("/PlaybackInfo"):
+            return FakeResponse(
+                {
+                    "PlaySessionId": "session-id",
+                    "MediaSources": [{"Id": "media-source", "DirectStreamUrl": "/stream"}],
+                }
+            )
+        if path == "/Sessions/Playing":
+            playing_payloads.append(kwargs["json"])
+            return FakeResponse()
+        if path == "/Sessions/Playing/Progress":
+            progress_calls += 1
+            if progress_calls == 1:
+                raise EmbyStatusError("playback_lease_inactive: The playback session is no longer active.")
+            return FakeResponse()
+        if path == "/Sessions/Playing/Stopped":
+            return FakeResponse()
+        raise AssertionError(f"Unexpected request: {method} {path}")
+
+    monkeypatch.setattr(api_module.asyncio, "sleep", fast_sleep)
+    monkeypatch.setattr(api_module.asyncio, "create_task", lambda coro: DummyStreamTask(coro))
+    monkeypatch.setattr(api_module.random, "uniform", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(emby, "_request", fake_request)
+
+    assert asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=20)) is True
+    assert progress_calls == 3
+    assert len(playing_payloads) == 2
+    assert all("EventName" not in payload for payload in playing_payloads)
+
+
 def test_watch_can_fallback_to_mark_played_when_item_lookup_fails(monkeypatch):
     emby = Emby(
         EmbyAccount(

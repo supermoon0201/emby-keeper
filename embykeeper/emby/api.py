@@ -2,7 +2,7 @@ import asyncio
 from datetime import datetime
 import random
 import string
-from urllib.parse import quote, quote_plus, urljoin, urlparse
+from urllib.parse import parse_qs, quote, quote_plus, urljoin, urlparse
 import uuid
 from typing import Iterable, List, Union, Optional
 import re
@@ -651,16 +651,34 @@ class Emby:
         )
         playback_info = resp.json()
 
-        play_session_id = playback_info.get("PlaySessionId", "")
+        play_session_id = ""
         media_source_id = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(32))
         direct_stream_url = None
         media_source_path = None
-        media_source_id, direct_stream_url, media_source_path = self._update_media_source_info(
-            media_source_id,
-            direct_stream_url,
-            media_source_path,
-            playback_info,
-        )
+
+        def update_playback_info(info):
+            nonlocal media_source_id, direct_stream_url, media_source_path, play_session_id
+
+            media_source_id, direct_stream_url, media_source_path = self._update_media_source_info(
+                media_source_id,
+                direct_stream_url,
+                media_source_path,
+                info,
+            )
+            response_session_id = info.get("PlaySessionId")
+            if response_session_id:
+                play_session_id = str(response_session_id)
+
+            # 自研后端可能把租约 ID 只放在最终流地址中, 上报必须与实际请求使用同一个 ID。
+            if direct_stream_url:
+                stream_query = parse_qs(urlparse(direct_stream_url).query)
+                for key in ("PlaySessionId", "playSessionId"):
+                    stream_session_id = stream_query.get(key, [None])[0]
+                    if stream_session_id:
+                        play_session_id = stream_session_id
+                        break
+
+        update_playback_info(playback_info)
 
         await asyncio.sleep(random.uniform(1, 3))
 
@@ -687,12 +705,7 @@ class Emby:
                 ),
                 json=playback_info_data,
             )
-            media_source_id, direct_stream_url, media_source_path = self._update_media_source_info(
-                media_source_id,
-                direct_stream_url,
-                media_source_path,
-                resp.json(),
-            )
+            update_playback_info(resp.json())
 
         # int4 上限 (PostgreSQL)，部分服务器使用 int4 存储 ticks，超出会报 500
         _INT4_MAX = 2_147_483_647
@@ -857,9 +870,49 @@ class Emby:
             consecutive_progress_errors = 0
             last_progress_error = None
             progress_reporting_enabled = True
+            lease_recovery_attempted = False
             report_interval = 5  # Start with 5 seconds
             report_count = 0
             max_interval = 300  # 5 minutes in seconds
+
+            async def report_progress(payload, tick):
+                nonlocal lease_recovery_attempted
+
+                try:
+                    return await asyncio.wait_for(
+                        self._request(
+                            method="POST",
+                            path="/Sessions/Playing/Progress",
+                            json=payload,
+                        ),
+                        10,
+                    )
+                except Exception as e:
+                    if lease_recovery_attempted or "playback_lease_inactive" not in str(e).lower():
+                        raise
+
+                    lease_recovery_attempted = True
+                    self.log.warning("播放租约已失效, 重新发送播放开始事件后重试进度.")
+                    await self._request(
+                        method="POST",
+                        path="/Sessions/Playing",
+                        json=get_playing_data(tick),
+                    )
+                    try:
+                        response = await asyncio.wait_for(
+                            self._request(
+                                method="POST",
+                                path="/Sessions/Playing/Progress",
+                                json=payload,
+                            ),
+                            10,
+                        )
+                    except Exception:
+                        raise
+                    else:
+                        lease_recovery_attempted = False
+                        return response
+
             while t > 0:
                 if last_report_t and last_report_t - t > report_interval:
                     self.log.info(f'正在播放: "{truncate_str(iname, 10)}" (还剩 {t:.0f} 秒).')
@@ -877,14 +930,7 @@ class Emby:
                 tick = int((time - t) * 10000000)
                 payload = get_playing_data(tick, update=True)
                 try:
-                    resp = await asyncio.wait_for(
-                        self._request(
-                            method="POST",
-                            path="/Sessions/Playing/Progress",
-                            json=payload,
-                        ),
-                        10,
-                    )
+                    resp = await report_progress(payload, tick)
                 except Exception as e:
                     last_progress_error = str(e)
                     consecutive_progress_errors += 1
