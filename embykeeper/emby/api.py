@@ -826,10 +826,7 @@ class Emby:
                         del i
                         await asyncio.sleep(random.random())
                         elapsed = (datetime.now() - request_started_at).total_seconds()
-                        if (
-                            read_bytes >= max_bytes_per_request
-                            or elapsed >= max_request_seconds
-                        ):
+                        if read_bytes >= max_bytes_per_request or elapsed >= max_request_seconds:
                             break
                         if random.random() < 0.01:
                             continue
@@ -868,6 +865,7 @@ class Emby:
 
             last_report_t = t
             consecutive_progress_errors = 0
+            max_progress_errors = 4
             last_progress_error = None
             progress_reporting_enabled = True
             lease_recovery_attempted = False
@@ -879,13 +877,11 @@ class Emby:
                 nonlocal lease_recovery_attempted
 
                 try:
-                    return await asyncio.wait_for(
-                        self._request(
-                            method="POST",
-                            path="/Sessions/Playing/Progress",
-                            json=payload,
-                        ),
-                        10,
+                    # 由请求层按配置控制超时和重试, 避免外层提前取消请求并丢失错误详情
+                    return await self._request(
+                        method="POST",
+                        path="/Sessions/Playing/Progress",
+                        json=payload,
                     )
                 except Exception as e:
                     if lease_recovery_attempted or "playback_lease_inactive" not in str(e).lower():
@@ -899,13 +895,10 @@ class Emby:
                         json=get_playing_data(tick),
                     )
                     try:
-                        response = await asyncio.wait_for(
-                            self._request(
-                                method="POST",
-                                path="/Sessions/Playing/Progress",
-                                json=payload,
-                            ),
-                            10,
+                        response = await self._request(
+                            method="POST",
+                            path="/Sessions/Playing/Progress",
+                            json=payload,
                         )
                     except Exception:
                         raise
@@ -932,16 +925,16 @@ class Emby:
                 try:
                     resp = await report_progress(payload, tick)
                 except Exception as e:
-                    last_progress_error = str(e)
+                    last_progress_error = str(e) or type(e).__name__
                     consecutive_progress_errors += 1
-                    if consecutive_progress_errors in (1, 3, 6, 12):
+                    if consecutive_progress_errors in (1, 3, max_progress_errors):
                         self.log.warning(
                             "播放状态设定错误"
-                            f" ({consecutive_progress_errors}/12): {last_progress_error}"
+                            f" ({consecutive_progress_errors}/{max_progress_errors}): {last_progress_error}"
                         )
                     else:
                         self.log.debug(f"播放状态设定错误: {e}")
-                    if consecutive_progress_errors > 3:
+                    if consecutive_progress_errors >= max_progress_errors:
                         if self.a.progress_fallback:
                             progress_reporting_enabled = False
                             self.log.warning(
@@ -1208,8 +1201,21 @@ class Emby:
         return resp.json().get("Items", [])
 
     async def get_item(self, iid, **kw) -> dict:
-        resp = await self._request(method="GET", path=f"/Users/{self.user_id}/Items/{iid}")
-        return resp.json()
+        path = f"/Users/{self.user_id}/Items/{iid}"
+        resp = await self._request(method="GET", path=path)
+        try:
+            item = resp.json()
+        except ValueError as e:
+            # 反代可能返回空响应或 HTML, 统一转换为业务异常以进入现有容错和重试流程
+            raise EmbyStatusError(
+                f"获取视频详情失败: 响应不是有效 JSON (HTTP {resp.status_code}, "
+                f"接口 = {path}, {self._describe_response(resp)})"
+            ) from e
+        if not isinstance(item, dict):
+            raise EmbyStatusError(
+                f"获取视频详情失败: 响应不是 JSON 对象 (HTTP {resp.status_code}, 接口 = {path})"
+            )
+        return item
 
     async def get_user(self) -> dict:
         """Get current user information."""

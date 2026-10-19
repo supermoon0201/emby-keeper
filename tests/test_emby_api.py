@@ -8,6 +8,21 @@ from embykeeper.emby.api import Emby, EmbyConnectError, EmbyEnv, EmbyPlayError, 
 from embykeeper.schema import EmbyAccount
 
 
+@pytest.fixture(autouse=True)
+def isolate_emby_environment(monkeypatch):
+    # 固定测试设备信息, 避免随机生成设备和读写本机账户缓存
+    def load_test_env(self):
+        self._env = EmbyEnv(
+            client="Fileball",
+            device="Test Device",
+            device_id="test-device-id",
+            client_version="1.3.30",
+            useragent="Fileball/1.3.30",
+        )
+
+    monkeypatch.setattr(Emby, "_load_env", load_test_env)
+
+
 class FakeResponse:
     def __init__(self, payload=None, status_code=200, text="", ok=True):
         self._payload = payload or {}
@@ -67,6 +82,89 @@ def build_emby():
     emby._token = "token"
     emby._user_id = "user-id"
     return emby
+
+
+@pytest.mark.parametrize("body", [b"", b"<html>upstream unavailable</html>"])
+def test_get_item_reports_invalid_json_as_status_error(monkeypatch, body):
+    emby = build_emby()
+    response = api_module.Response()
+    response.status_code = 200
+    response.content = body
+
+    async def fake_request(method, path, **kwargs):
+        assert (method, path) == ("GET", "/Users/user-id/Items/item-id")
+        return response
+
+    monkeypatch.setattr(emby, "_request", fake_request)
+
+    with pytest.raises(EmbyStatusError, match="响应不是有效 JSON") as error:
+        asyncio.run(emby.get_item("item-id"))
+
+    assert "HTTP 200" in str(error.value)
+    assert "/Users/user-id/Items/item-id" in str(error.value)
+    assert (body.decode() if body else "响应内容为空") in str(error.value)
+    assert isinstance(error.value.__cause__, ValueError)
+
+
+@pytest.mark.parametrize("body", [b"null", b"[]", b'"unexpected"'])
+def test_get_item_rejects_non_object_json(monkeypatch, body):
+    emby = build_emby()
+    response = api_module.Response()
+    response.status_code = 200
+    response.content = body
+
+    async def fake_request(*args, **kwargs):
+        return response
+
+    monkeypatch.setattr(emby, "_request", fake_request)
+
+    with pytest.raises(EmbyStatusError, match="响应不是 JSON 对象"):
+        asyncio.run(emby.get_item("item-id"))
+
+
+def test_watch_retries_playback_after_invalid_item_json(monkeypatch):
+    emby = build_emby()
+    emby.a.time = 20
+    emby.items = {
+        "item-id": {"Id": "item-id", "Name": "Demo", "MediaType": "Video", "RunTimeTicks": 600000000}
+    }
+    get_item_calls = 0
+    play_calls = 0
+
+    async def fake_request(method, path, **kwargs):
+        nonlocal get_item_calls
+        assert (method, path) == ("GET", "/Users/user-id/Items/item-id")
+        get_item_calls += 1
+        response = api_module.Response()
+        response.status_code = 200
+        # 第一次获取详情返回空响应, 播放重试后返回真实播放状态
+        response.content = (
+            b""
+            if get_item_calls == 1
+            else (
+                b'{"Id":"item-id","UserData":{"PlayCount":' + (b"1" if get_item_calls >= 3 else b"0") + b"}}"
+            )
+        )
+        return response
+
+    async def fake_play(item, time):
+        nonlocal play_calls
+        play_calls += 1
+        if play_calls == 1:
+            raise EmbyConnectError("temporary-timeout")
+        return True
+
+    async def fast_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(emby, "_request", fake_request)
+    monkeypatch.setattr(emby, "play", fake_play)
+    monkeypatch.setattr(api_module.asyncio, "sleep", fast_sleep)
+    api_module.config.set({"emby": {"retries": 1}})
+
+    assert asyncio.run(emby.watch()) is True
+    assert play_calls == 2
+    assert get_item_calls == 3
 
 
 def test_build_headers_uses_logged_in_user_id_for_emby_authorization():
@@ -259,6 +357,46 @@ def test_play_tolerates_recovered_progress_update_failures(monkeypatch):
 
     assert asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=270)) is True
     assert get_progress_calls() == 27
+
+
+def test_play_allows_progress_request_timeout_longer_than_ten_seconds(monkeypatch):
+    emby = build_emby()
+    emby.a.timeout = 30
+    original_sleep = asyncio.sleep
+    original_wait_for = asyncio.wait_for
+    get_progress_calls = install_play_stubs(monkeypatch, emby, lambda _call: False)
+    original_request = emby._request
+
+    async def slow_progress_request(method, path, **kwargs):
+        if path == "/Sessions/Playing/Progress":
+            await original_sleep(0.02)
+        return await original_request(method, path, **kwargs)
+
+    async def scaled_wait_for(awaitable, timeout):
+        # 将时间缩小千倍, 模拟进度请求耗时超过旧的 10 秒外层限制
+        return await original_wait_for(awaitable, timeout / 1000)
+
+    monkeypatch.setattr(emby, "_request", slow_progress_request)
+    monkeypatch.setattr(api_module.asyncio, "wait_for", scaled_wait_for)
+
+    assert asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=40)) is True
+    assert get_progress_calls() == 4
+
+
+def test_play_keeps_error_type_when_progress_exception_is_empty(monkeypatch):
+    emby = build_emby()
+    install_play_stubs(monkeypatch, emby, lambda _call: False)
+    original_request = emby._request
+
+    async def failing_progress_request(method, path, **kwargs):
+        if path == "/Sessions/Playing/Progress":
+            raise asyncio.TimeoutError()
+        return await original_request(method, path, **kwargs)
+
+    monkeypatch.setattr(emby, "_request", failing_progress_request)
+
+    with pytest.raises(EmbyPlayError, match="播放进度上报连续失败: TimeoutError"):
+        asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=40))
 
 
 def test_play_still_fails_after_too_many_consecutive_progress_errors(monkeypatch):
@@ -576,7 +714,9 @@ def test_build_cdn_stream_url_uses_media_source_path():
 
     url = emby._build_cdn_stream_url("https://starharn.nebula-media.org/cdn?path=Nebula Media/test.mkv")
 
-    assert url.startswith("https://emby-cdn1.nebula-media.org/cdn?path=https%3A%2F%2Fstarharn.nebula-media.org")
+    assert url.startswith(
+        "https://emby-cdn1.nebula-media.org/cdn?path=https%3A%2F%2Fstarharn.nebula-media.org"
+    )
     assert url.endswith("&api_key=token")
 
 
