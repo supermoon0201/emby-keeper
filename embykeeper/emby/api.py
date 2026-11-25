@@ -2,12 +2,14 @@ import asyncio
 from datetime import datetime
 import random
 import string
+from time import monotonic
 from urllib.parse import parse_qs, quote, quote_plus, urljoin, urlparse
 import uuid
 from typing import Iterable, List, Union, Optional
 import re
 
 import httpx
+from curl_cffi import CurlInfo
 from loguru import logger
 from curl_cffi.requests import AsyncSession, Response, RequestsError
 from pydantic import BaseModel, ValidationError
@@ -100,18 +102,66 @@ class Emby:
         return bool(self.a.stream_cdn_path)
 
     @staticmethod
-    def _describe_response(resp: Response, limit: int = 200) -> str:
-        try:
-            body = (resp.text or "").strip()
-        except Exception:
-            body = ""
-
+    def _describe_text(body: str, limit: int = 200) -> str:
+        body = (body or "").strip()
         if body:
             body = re.sub(r"\s+", " ", body)
             if len(body) > limit:
                 body = f"{body[:limit]}..."
             return f"响应内容: {body}"
         return "响应内容为空"
+
+    @classmethod
+    def _describe_response(cls, resp: Response, limit: int = 200) -> str:
+        try:
+            body = resp.text or ""
+        except Exception:
+            body = ""
+        return cls._describe_text(body, limit=limit)
+
+    @staticmethod
+    def _get_header(resp: Response, name: str) -> str:
+        headers = getattr(resp, "headers", None) or {}
+        value = headers.get(name)
+        if value is None:
+            lower_name = name.lower()
+            for key, val in headers.items():
+                if str(key).lower() == lower_name:
+                    value = val
+                    break
+        return str(value).strip() if value is not None else ""
+
+    @classmethod
+    def _is_large_or_media_response(cls, resp: Response, max_bytes: int = 65536) -> bool:
+        content_type = cls._get_header(resp, "content-type").split(";", 1)[0].strip().lower()
+        if content_type.startswith(("video/", "audio/")) or content_type == "application/octet-stream":
+            return True
+        content_length = cls._get_header(resp, "content-length")
+        if content_length.isdigit() and int(content_length) > max_bytes:
+            return True
+        return False
+
+    @staticmethod
+    async def _read_stream_preview(resp: Response, limit: int = 8192) -> str:
+        chunks = []
+        total = 0
+        async for chunk in resp.aiter_content():
+            if not chunk:
+                continue
+            remaining = limit - total
+            chunks.append(chunk[:remaining])
+            total += min(len(chunk), remaining)
+            if total >= limit:
+                break
+        return b"".join(chunks).decode("utf-8", errors="replace")
+
+    @staticmethod
+    async def _close_stream_response(resp: Response):
+        # curl_cffi 0.9.x 的 Response.aclose() 未设置 quit_now, 直接 await 会等待整条流下载完成
+        quit_now = getattr(resp, "quit_now", None)
+        if quit_now is not None:
+            quit_now.set()
+        await resp.aclose()
 
     @property
     def token(self):
@@ -281,6 +331,41 @@ class Emby:
             impersonate="chrome",
             allow_redirects=True,
             default_headers=False,
+            # 保留失败请求的连接阶段数据, 不记录请求头、查询参数或响应正文
+            curl_infos=[
+                CurlInfo.PRIMARY_IP,
+                CurlInfo.NAMELOOKUP_TIME,
+                CurlInfo.CONNECT_TIME,
+                CurlInfo.APPCONNECT_TIME,
+                CurlInfo.STARTTRANSFER_TIME,
+                CurlInfo.TOTAL_TIME,
+                CurlInfo.HTTP_VERSION,
+            ],
+        )
+
+    @staticmethod
+    def _describe_connection(response: Optional[Response], elapsed: float) -> str:
+        # 各阶段耗时均从请求开始累计, 零值只表示未取得该阶段数据, 不据此断言故障原因
+        infos = getattr(response, "infos", {}) or {}
+        ip = infos.get(CurlInfo.PRIMARY_IP) or "未知"
+        if isinstance(ip, bytes):
+            ip = ip.decode("ascii", errors="replace")
+        timings = []
+        for label, key in (
+            ("DNS", CurlInfo.NAMELOOKUP_TIME),
+            ("TCP", CurlInfo.CONNECT_TIME),
+            ("TLS", CurlInfo.APPCONNECT_TIME),
+            ("首字节", CurlInfo.STARTTRANSFER_TIME),
+            ("总计", CurlInfo.TOTAL_TIME),
+        ):
+            value = infos.get(key)
+            timings.append(f"{label}={value:.3f}" if isinstance(value, (int, float)) else f"{label}=未知")
+        version = {1: "1.0", 2: "1.1", 3: "2", 30: "3"}.get(infos.get(CurlInfo.HTTP_VERSION), "未知")
+        content = getattr(response, "content", None)
+        received = len(content) if isinstance(content, (bytes, bytearray)) else "未知"
+        return (
+            f"目标IP={ip}, HTTP={version}, 累计耗时(秒): {', '.join(timings)}, "
+            f"实际耗时={elapsed:.3f} 秒, 接收字节={received}"
         )
 
     def _get_stream_timeout(self) -> httpx.Timeout:
@@ -416,38 +501,77 @@ class Emby:
         cache.set(cache_key, self._base_path)
         return self._base_path
 
-    async def _request(self, method: str, path: str, _login=False, **kw) -> Response:
+    async def _request(self, method: str, path: str, _login=False, _discard_body=False, **kw) -> Response:
 
         url = await self._build_url(path)
         last_err = None
-        for _ in range(3):
+        for attempt in range(1, 4):
+            started_at = monotonic()
             try:
                 async with self._get_session() as session:
-                    resp: Response = await session.request(method, url, **kw)
-                    if resp.status_code == 401 and self.a.username and not _login:
-                        if not await self.login():
-                            raise EmbyLoginError("无法登陆到服务器")
-                        continue
-                    elif resp.status_code in self._transient_status_codes:
-                        # 站点前置反代或 Cloudflare 可能返回瞬时错误, 这里统一按可重试处理
-                        await asyncio.sleep(random.random() * 2 + 0.5)
-                        continue
-                    elif resp.status_code == 403 and (
-                        "cf-wrapper" in resp.text or "Just a moment" in resp.text
-                    ):
-                        if self.cf_clearance:
-                            raise EmbyStatusError("访问失败: Cloudflare 验证码解析后依然有验证")
-                        await self.use_cfsolver()
-                        continue
-                    elif not resp.ok and not _login:
-                        raise EmbyStatusError(
-                            f"访问失败: 异常 HTTP 代码 {resp.status_code} (URL = {url}, "
-                            f"{self._describe_response(resp)})"
-                        )
-                    else:
-                        return resp
+                    request_kw = {**kw, "stream": True} if _discard_body else kw
+                    resp: Response = await session.request(method, url, **request_kw)
+                    try:
+                        if resp.status_code == 401 and self.a.username and not _login:
+                            if not await self.login():
+                                raise EmbyLoginError("无法登陆到服务器")
+                            continue
+                        elif resp.status_code in self._transient_status_codes:
+                            # 站点前置反代或 Cloudflare 可能返回瞬时错误, 这里统一按可重试处理
+                            await asyncio.sleep(random.random() * 2 + 0.5)
+                            continue
+                        elif resp.status_code == 403:
+                            body_text = (
+                                await self._read_stream_preview(resp) if _discard_body else (resp.text or "")
+                            )
+                            if "cf-wrapper" in body_text or "Just a moment" in body_text:
+                                if self.cf_clearance:
+                                    raise EmbyStatusError("访问失败: Cloudflare 验证码解析后依然有验证")
+                                await self.use_cfsolver()
+                                continue
+                            if not _login:
+                                desc = (
+                                    self._describe_text(body_text)
+                                    if _discard_body
+                                    else self._describe_response(resp)
+                                )
+                                raise EmbyStatusError(
+                                    f"访问失败: 异常 HTTP 代码 {resp.status_code} (URL = {url}, {desc})"
+                                )
+                            return resp
+                        elif not resp.ok and not _login:
+                            desc = (
+                                self._describe_text(await self._read_stream_preview(resp, limit=512))
+                                if _discard_body
+                                else self._describe_response(resp)
+                            )
+                            raise EmbyStatusError(
+                                f"访问失败: 异常 HTTP 代码 {resp.status_code} (URL = {url}, {desc})"
+                            )
+                        else:
+                            if _discard_body:
+                                if self._is_large_or_media_response(resp):
+                                    # 部分反代或自研后端会把 /Videos/{id}/AdditionalParts 误路由到视频流,
+                                    # 直接放弃正文并关闭连接, 避免整部视频下载导致超时。
+                                    self.log.debug(
+                                        f"跳过读取非预期的大体积或媒体响应 ({path}, "
+                                        f"Content-Type={self._get_header(resp, 'content-type') or '未知'}, "
+                                        f"Content-Length={self._get_header(resp, 'content-length') or '未知'})"
+                                    )
+                                else:
+                                    await self._read_stream_preview(resp, limit=65536)
+                            return resp
+                    finally:
+                        if _discard_body:
+                            await self._close_stream_response(resp)
             except RequestsError as e:
                 last_err = e
+                # 仅输出连接元数据, 避免异常中的完整 URL 或认证信息进入逐次诊断日志
+                detail = self._describe_connection(getattr(e, "response", None), monotonic() - started_at)
+                self.log.warning(
+                    f"请求连接失败 ({method}, 尝试 {attempt}/3, curl={getattr(e, 'code', '未知')}, "
+                    f"使用代理={bool(self.proxy)}): {detail}"
+                )
                 await asyncio.sleep(random.random() + 0.5)
 
         if last_err:
@@ -632,6 +756,7 @@ class Emby:
                     Recursive=True,
                     SortBy="SortName",
                 ),
+                _discard_body=True,
             )
         except EmbyStatusError:
             # 部分服务器不支持该接口, 忽略错误继续播放
@@ -789,7 +914,7 @@ class Emby:
                         await client.aclose()
                         client = None
                         if not redirect_url:
-                            raise EmbyStatusError(f"访问失败: 流媒体重定向缺少目标地址 (URL = {stream_url})")
+                            raise EmbyStatusError("访问失败: 流媒体重定向缺少目标地址")
                         parsed_redirect = urlparse(redirect_url)
                         redirect_headers = stream_headers
                         if parsed_redirect.netloc and parsed_redirect.netloc != parsed_original.netloc:
@@ -812,10 +937,8 @@ class Emby:
                         response = await response_cm.__aenter__()
 
                     if response.status_code >= 400:
-                        raise EmbyStatusError(
-                            f"访问失败: 异常 HTTP 代码 {response.status_code} (URL = {response.request.url}, "
-                            f"{self._describe_response(response)})"
-                        )
+                        # 流媒体地址可能包含认证令牌, 只记录 HTTP 状态
+                        raise EmbyStatusError(f"访问流媒体失败: 异常 HTTP 代码 {response.status_code}")
 
                     request_started_at = datetime.now()
                     read_bytes = 0
@@ -977,6 +1100,17 @@ class Emby:
                 raise
             raise EmbyPlayError(f"由于连接错误或服务器错误无法停止播放: {e}")
 
+    @staticmethod
+    def _parse_homepage_json(response: Response, expected_type, operation: str):
+        # 反代可能把错误页或空响应标记为 HTTP 200, 交给现有的首页取片兜底处理
+        try:
+            data = response.json()
+        except ValueError as e:
+            raise EmbyStatusError(f"{operation}: 响应不是有效 JSON (HTTP {response.status_code})") from e
+        if not isinstance(data, expected_type):
+            raise EmbyStatusError(f"{operation}: JSON 结构不正确 (HTTP {response.status_code})")
+        return data
+
     async def load_main_page(self):
         col_ids = []
         try:
@@ -985,7 +1119,7 @@ class Emby:
                 path=f"/Users/{self.user_id}/Views",
                 params=dict(IncludeExternalContent=False),
             )
-            for i in views.json().get("Items", []):
+            for i in self._parse_homepage_json(views, dict, "首页目录").get("Items", []):
                 cid: str = i.get("Id", None)
                 type: str = i.get("CollectionType")
                 if cid and type and type.lower() in ("movies", "tvshows"):
@@ -998,8 +1132,8 @@ class Emby:
         last_login_date = None
         try:
             # 部分站点会对用户详情接口单独挂反代或风控, 该接口失败时不应影响首页取片流程
-            user = await self._request(method="GET", path=f"/Users/{self.user_id}")
-            last_login_date = user.json().get("LastLoginDate", None)
+            user = await self.get_user()
+            last_login_date = user.get("LastLoginDate", None)
         except EmbyError as e:
             self.log.warning(f"获取用户信息失败, 将继续尝试加载首页项目: {e}")
         await asyncio.sleep(random.uniform(0.1, 0.3))
@@ -1136,7 +1270,7 @@ class Emby:
             path=f"/Users/{self.user_id}/Items/Latest",
             params=params,
         )
-        return resp.json()
+        return self._parse_homepage_json(resp, list, "最新项目")
 
     async def get_resume_items(
         self,
@@ -1164,7 +1298,7 @@ class Emby:
                 **kw,
             },
         )
-        data = resp.json()
+        data = self._parse_homepage_json(resp, (dict, list), "继续观看列表")
         if isinstance(data, dict):
             return data.get("Items", [])
         return data
@@ -1198,7 +1332,7 @@ class Emby:
                 **kw,
             },
         )
-        return resp.json().get("Items", [])
+        return self._parse_homepage_json(resp, dict, "文件夹项目").get("Items", [])
 
     async def get_item(self, iid, **kw) -> dict:
         path = f"/Users/{self.user_id}/Items/{iid}"
@@ -1220,7 +1354,7 @@ class Emby:
     async def get_user(self) -> dict:
         """Get current user information."""
         response = await self._request("GET", f"/Users/{self.user_id}")
-        return response.json()
+        return self._parse_homepage_json(response, dict, "用户信息")
 
     @staticmethod
     def _get_playback_evidence(before_item: Optional[dict], after_item: Optional[dict]) -> Optional[str]:

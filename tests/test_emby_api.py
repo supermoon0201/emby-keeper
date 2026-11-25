@@ -106,6 +106,28 @@ def test_get_item_reports_invalid_json_as_status_error(monkeypatch, body):
     assert isinstance(error.value.__cause__, ValueError)
 
 
+@pytest.mark.parametrize("body", [b"", b"<html>upstream unavailable</html>", b"null"])
+def test_homepage_falls_back_when_api_returns_invalid_data(monkeypatch, body):
+    emby = build_emby()
+    video = {"Id": "latest-video", "MediaType": "Video"}
+    requested_paths = []
+
+    async def fake_request(method, path, **kwargs):
+        requested_paths.append(path)
+        if path.endswith("/Latest"):
+            return FakeResponse([video])
+        response = api_module.Response()
+        response.status_code = 200
+        response.content = body
+        return response
+
+    monkeypatch.setattr(emby, "_request", fake_request)
+
+    assert asyncio.run(emby.load_main_page()) is None
+    assert requested_paths[-1] == "/Users/user-id/Items/Latest"
+    assert emby.items == {"latest-video": video}
+
+
 @pytest.mark.parametrize("body", [b"null", b"[]", b'"unexpected"'])
 def test_get_item_rejects_non_object_json(monkeypatch, body):
     emby = build_emby()
@@ -306,6 +328,88 @@ def test_request_retries_transient_cloudflare_status(monkeypatch):
 
     assert response.status_code == 200
     assert statuses == []
+
+
+def test_session_collects_connection_metadata(monkeypatch):
+    emby = build_emby()
+    api_module.config.set({"emby": {"timeout": 10}})
+    captured = {}
+
+    def fake_session(**kwargs):
+        captured.update(kwargs)
+        return "session"
+
+    monkeypatch.setattr(api_module, "AsyncSession", fake_session)
+
+    assert emby._get_session() == "session"
+    assert captured["timeout"] == 10
+    assert api_module.CurlInfo.PRIMARY_IP in captured["curl_infos"]
+    assert api_module.CurlInfo.APPCONNECT_TIME in captured["curl_infos"]
+    assert api_module.CurlInfo.STARTTRANSFER_TIME in captured["curl_infos"]
+
+
+@pytest.mark.parametrize("response", [None, FakeResponse()])
+def test_connection_diagnostics_handle_missing_response_metadata(response):
+    detail = Emby._describe_connection(response, 10.25)
+
+    assert "目标IP=未知" in detail
+    assert "TLS=未知" in detail
+    assert "实际耗时=10.250" in detail
+
+
+def test_request_timeout_diagnostics_preserve_retry_and_exclude_secrets(monkeypatch):
+    emby = build_emby()
+    api_module.config.set({"emby": {}})
+    info = api_module.CurlInfo
+    response = FakeResponse(text="private-response")
+    response.url = "https://example.com/Users/private-user?api_key=private-key"
+    response.headers = {"X-Emby-Token": "private-token"}
+    response.content = b""
+    response.infos = {
+        info.PRIMARY_IP: b"192.0.2.1",
+        info.NAMELOOKUP_TIME: 0.01,
+        info.CONNECT_TIME: 0.02,
+        info.APPCONNECT_TIME: 0.03,
+        info.STARTTRANSFER_TIME: 0.0,
+        info.TOTAL_TIME: 10.0,
+        info.HTTP_VERSION: 3,
+    }
+    warnings = []
+    calls = []
+
+    class DummySession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, **kwargs):
+            calls.append((method, url))
+            if len(calls) == 1:
+                raise api_module.RequestsError("private-exception", code=28, response=response)
+            return FakeResponse()
+
+    class CaptureLogger:
+        warning = warnings.append
+
+    async def fast_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(emby, "_get_session", DummySession)
+    monkeypatch.setattr(emby, "log", CaptureLogger())
+    monkeypatch.setattr(api_module.asyncio, "sleep", fast_sleep)
+
+    assert asyncio.run(emby._request("GET", "/Users/private-user")).status_code == 200
+    assert len(calls) == 2
+    assert len(warnings) == 1
+    assert "尝试 1/3" in warnings[0]
+    assert "curl=28" in warnings[0]
+    assert "目标IP=192.0.2.1" in warnings[0]
+    assert "HTTP=2" in warnings[0]
+    assert "TLS=0.030" in warnings[0]
+    assert "首字节=0.000" in warnings[0]
+    assert "private-" not in warnings[0]
 
 
 def install_play_stubs(monkeypatch, emby, should_fail_progress_call):
@@ -1143,3 +1247,123 @@ def test_watch_marks_item_played_when_server_does_not_increment_play_count(monke
 
     assert asyncio.run(emby.watch()) is True
     assert mark_played_calls == ["item-id"]
+
+
+def test_request_discard_body_skips_media_stream_and_closes_response(monkeypatch):
+    emby = build_emby()
+    request_kwargs = {}
+    state = {"iterated": False, "quit_set_before_close": False, "closed": False}
+
+    class DummyQuitEvent:
+        def __init__(self):
+            self.is_set = False
+
+        def set(self):
+            self.is_set = True
+
+    class MediaStreamResponse:
+        status_code = 200
+        ok = True
+        headers = {
+            "Content-Type": "video/x-matroska",
+            "Content-Length": "750998289",
+        }
+
+        def __init__(self):
+            self.quit_now = DummyQuitEvent()
+
+        async def aiter_content(self):
+            state["iterated"] = True
+            yield b"should-not-be-read"
+
+        async def aclose(self):
+            state["quit_set_before_close"] = self.quit_now.is_set
+            state["closed"] = True
+
+    class DummySession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, **kwargs):
+            request_kwargs.update(kwargs)
+            return MediaStreamResponse()
+
+    monkeypatch.setattr(emby, "_get_session", DummySession)
+
+    resp = asyncio.run(emby._request("GET", "/Videos/ep-1/AdditionalParts", _discard_body=True))
+
+    assert resp.status_code == 200
+    assert request_kwargs["stream"] is True
+    assert state["iterated"] is False
+    assert state["quit_set_before_close"] is True
+    assert state["closed"] is True
+
+
+def test_request_discard_body_bounds_unknown_chunked_response_and_closes(monkeypatch):
+    emby = build_emby()
+    state = {"chunks": 0, "closed": False}
+
+    class ChunkedResponse:
+        status_code = 200
+        ok = True
+        headers = {"Content-Type": "application/json"}
+
+        async def aiter_content(self):
+            for _ in range(100):
+                state["chunks"] += 1
+                yield b"x" * 16384
+
+        async def aclose(self):
+            state["closed"] = True
+
+    class DummySession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, **kwargs):
+            return ChunkedResponse()
+
+    monkeypatch.setattr(emby, "_get_session", DummySession)
+
+    resp = asyncio.run(emby._request("GET", "/Videos/ep-1/AdditionalParts", _discard_body=True))
+
+    assert resp.status_code == 200
+    assert state["chunks"] == 4
+    assert state["closed"] is True
+
+
+def test_play_requests_additional_parts_with_discard_body(monkeypatch):
+    emby = build_emby()
+    additional_parts_kwargs = {}
+
+    async def fast_sleep(_seconds):
+        return None
+
+    async def fake_request(method, path, **kwargs):
+        if path.endswith("/AdditionalParts"):
+            additional_parts_kwargs.update(kwargs)
+            return FakeResponse()
+        if path.startswith("/Items/") and path.endswith("/PlaybackInfo"):
+            return FakeResponse(
+                {
+                    "PlaySessionId": "session-id",
+                    "MediaSources": [{"Id": "media-source", "DirectStreamUrl": "/stream"}],
+                }
+            )
+        if path in ("/Sessions/Playing", "/Sessions/Playing/Progress", "/Sessions/Playing/Stopped"):
+            return FakeResponse()
+        raise AssertionError(f"Unexpected request: {method} {path}")
+
+    monkeypatch.setattr(api_module.asyncio, "sleep", fast_sleep)
+    monkeypatch.setattr(api_module.asyncio, "create_task", lambda coro: DummyStreamTask(coro))
+    monkeypatch.setattr(api_module.random, "uniform", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(emby, "_request", fake_request)
+
+    assert asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=20)) is True
+    assert additional_parts_kwargs.get("_discard_body") is True
