@@ -217,7 +217,7 @@ def _find_account_by_key(account_key: str) -> EmbyAccount:
 
 
 async def _run_single_account(account: EmbyAccount, description: Optional[str] = None):
-    manager = EmbyManager()
+    manager = EmbyManager(watch_config=False)
     result = await manager._watch_main([account], instant=True, description=description)
     if result is None:
         raise HTTPException(status_code=500, detail="Failed to start Emby test run")

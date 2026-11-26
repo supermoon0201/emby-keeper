@@ -53,7 +53,7 @@ class _AccountState:
 class CheckinerManager:
     '''Check-in manager.'''
 
-    def __init__(self):
+    def __init__(self, watch_config: bool = True):
         self._accounts: Dict[str, _AccountState] = {}
         self._schedulers: Dict[str, Scheduler] = {}
         self._scheduler_tasks: Dict[str, asyncio.Task] = {}
@@ -63,9 +63,10 @@ class CheckinerManager:
         self._reconcile_task: Optional[asyncio.Task] = None
         self._reconcile_dirty = False
 
-        config.on_list_change("telegram.account", self._handle_account_change)
-        config.on_change("checkiner", self._handle_config_change)
-        config.on_change("site.checkiner", self._handle_config_change)
+        if watch_config:
+            config.on_list_change("telegram.account", self._handle_account_change)
+            config.on_change("checkiner", self._handle_config_change)
+            config.on_change("site.checkiner", self._handle_config_change)
 
     def _module_enabled(self):
         return bool(config.checkiner.enabled) if config.checkiner else True

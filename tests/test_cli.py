@@ -107,8 +107,12 @@ class FakeEmbyManager:
 
 def prepare_main_monkeypatch(monkeypatch, tmp_path: Path):
     fake_apprise_module = types.SimpleNamespace(
-        Apprise=lambda: types.SimpleNamespace(add=lambda *_args, **_kwargs: None, notify=lambda **_kwargs: True),
-        NotifyType=types.SimpleNamespace(INFO="info", WARNING="warning", FAILURE="failure", SUCCESS="success"),
+        Apprise=lambda: types.SimpleNamespace(
+            add=lambda *_args, **_kwargs: None, notify=lambda **_kwargs: True
+        ),
+        NotifyType=types.SimpleNamespace(
+            INFO="info", WARNING="warning", FAILURE="failure", SUCCESS="success"
+        ),
     )
     monkeypatch.setitem(sys.modules, "apprise", fake_apprise_module)
     fake_cache_module = types.SimpleNamespace(
@@ -168,6 +172,9 @@ def run_main(tmp_path: Path, **overrides):
         messager=False,
         registrar=False,
         registrar_bot=None,
+        api=False,
+        api_host="0.0.0.0",
+        api_port=8000,
         version=False,
         example_config=False,
         instant=False,
@@ -208,3 +215,135 @@ def test_main_once_mode_exits_without_notifier(monkeypatch, tmp_path: Path):
     run_main(tmp_path, once=True)
 
     assert calls == {"start": 0, "stop": 0}
+
+
+def test_main_api_mode_runs_schedulers_and_cleans_up_on_server_exit(monkeypatch, tmp_path: Path):
+    calls = prepare_main_monkeypatch(monkeypatch, tmp_path)
+    from embykeeper.utils import AsyncTaskPool
+    import embykeeper.api as api_pkg
+    import embykeeper.emby.main as emby_main_module
+
+    events = {
+        "scheduled": False,
+        "cancelled": False,
+        "stopped": 0,
+        "served": False,
+        "bind": None,
+    }
+
+    class BlockingEmbyManager:
+        async def schedule_all(self):
+            events["scheduled"] = True
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                events["cancelled"] = True
+                raise
+
+        def stop_all(self):
+            events["stopped"] += 1
+
+    class FakeUvicornConfig:
+        def __init__(self, app, host, port, **_kwargs):
+            self.app = app
+            self.host = host
+            self.port = port
+
+    class FakeUvicornServer:
+        def __init__(self, config_obj):
+            self.config = config_obj
+            self.should_exit = False
+
+        async def serve(self):
+            events["bind"] = (self.config.host, self.config.port)
+            # 等待后台调度与通知初始化完成至少一个事件循环周期
+            await asyncio.sleep(0.05)
+            events["served"] = True
+
+    monkeypatch.setattr(cli_module, "AsyncTaskPool", AsyncTaskPool)
+    monkeypatch.setattr(emby_main_module, "EmbyManager", BlockingEmbyManager)
+    monkeypatch.setattr(api_pkg, "create_app", lambda: object())
+    monkeypatch.setitem(
+        sys.modules,
+        "uvicorn",
+        types.SimpleNamespace(Config=FakeUvicornConfig, Server=FakeUvicornServer),
+    )
+
+    run_main(tmp_path, api=True, api_host="127.0.0.1", api_port=8001, once=False)
+
+    assert events == {
+        "scheduled": True,
+        "cancelled": True,
+        "stopped": 1,
+        "served": True,
+        "bind": ("127.0.0.1", 8001),
+    }
+    assert calls == {"start": 1, "stop": 1}
+
+
+def test_main_api_mode_starts_server_without_waiting_for_slow_notifier(monkeypatch, tmp_path: Path):
+    calls = prepare_main_monkeypatch(monkeypatch, tmp_path)
+    from embykeeper.utils import AsyncTaskPool
+    import embykeeper.api as api_pkg
+    import embykeeper.notify as notify_module
+
+    notifier_cancelled = False
+    server_started = False
+
+    async def hanging_start_notifier():
+        nonlocal notifier_cancelled
+        calls["start"] += 1
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            notifier_cancelled = True
+            raise
+
+    class FakeUvicornConfig:
+        def __init__(self, app, host, port, **_kwargs):
+            self.app = app
+            self.host = host
+            self.port = port
+
+    class FakeUvicornServer:
+        def __init__(self, config_obj):
+            self.config = config_obj
+            self.should_exit = False
+
+        async def serve(self):
+            nonlocal server_started
+            server_started = True
+            await asyncio.sleep(0.02)
+
+    monkeypatch.setattr(cli_module, "AsyncTaskPool", AsyncTaskPool)
+    monkeypatch.setattr(notify_module, "start_notifier", hanging_start_notifier)
+    monkeypatch.setattr(api_pkg, "create_app", lambda: object())
+    monkeypatch.setitem(
+        sys.modules,
+        "uvicorn",
+        types.SimpleNamespace(Config=FakeUvicornConfig, Server=FakeUvicornServer),
+    )
+
+    run_main(tmp_path, api=True, api_host="127.0.0.1", api_port=8001, once=False)
+
+    assert server_started is True
+    assert notifier_cancelled is True
+    assert calls == {"start": 1, "stop": 0}
+
+
+def test_emby_manager_watch_config_false_skips_callbacks(monkeypatch):
+    import embykeeper.emby.main as emby_main_module
+
+    registered = []
+    fake_config = types.SimpleNamespace(
+        on_change=lambda key, cb: registered.append(("change", key)),
+        on_list_change=lambda key, cb: registered.append(("list", key)),
+    )
+    monkeypatch.setattr(emby_main_module, "config", fake_config)
+
+    emby_main_module.EmbyManager(watch_config=False)
+    assert registered == []
+
+    emby_main_module.EmbyManager()
+    assert ("change", "emby.time_range") in registered
+    assert ("list", "emby.account") in registered

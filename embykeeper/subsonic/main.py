@@ -81,17 +81,18 @@ class SubsonicManager:
             )
         return ctx.finish(RunStatus.SUCCESS, f"保活成功")
 
-    def __init__(self):
+    def __init__(self, watch_config: bool = True):
         self._tasks: Dict[str, asyncio.Task] = {}
         self._schedulers: Dict[str, Scheduler] = {}
         self._scheduler_tasks: Dict[str, asyncio.Task] = {}
         self._keepalive = asyncio.Event()
 
-        config.on_list_change("subsonic.account", self._handle_account_change)
-        config.on_change("subsonic.enabled", self._handle_config_change)
-        config.on_change("subsonic.time_range", self._handle_schedule_change)
-        config.on_change("subsonic.interval_days", self._handle_schedule_change)
-        config.on_change("subsonic.concurrency", self._handle_runtime_config_change)
+        if watch_config:
+            config.on_list_change("subsonic.account", self._handle_account_change)
+            config.on_change("subsonic.enabled", self._handle_config_change)
+            config.on_change("subsonic.time_range", self._handle_schedule_change)
+            config.on_change("subsonic.interval_days", self._handle_schedule_change)
+            config.on_change("subsonic.concurrency", self._handle_runtime_config_change)
 
     def _module_enabled(self):
         return bool(config.subsonic.enabled) if config.subsonic else True

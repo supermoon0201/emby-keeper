@@ -21,17 +21,18 @@ logger = logger.bind(scheme="embywatcher")
 
 
 class EmbyManager:
-    def __init__(self):
+    def __init__(self, watch_config: bool = True):
         self._tasks: Dict[str, asyncio.Task] = {}
         self._schedulers: Dict[str, Scheduler] = {}
         self._scheduler_tasks: Dict[str, asyncio.Task] = {}
         self._keepalive = asyncio.Event()
 
-        config.on_list_change("emby.account", self._handle_account_change)
-        config.on_change("emby.enabled", self._handle_config_change)
-        config.on_change("emby.time_range", self._handle_schedule_change)
-        config.on_change("emby.interval_days", self._handle_schedule_change)
-        config.on_change("emby.concurrency", self._handle_runtime_config_change)
+        if watch_config:
+            config.on_list_change("emby.account", self._handle_account_change)
+            config.on_change("emby.enabled", self._handle_config_change)
+            config.on_change("emby.time_range", self._handle_schedule_change)
+            config.on_change("emby.interval_days", self._handle_schedule_change)
+            config.on_change("emby.concurrency", self._handle_runtime_config_change)
 
     def _module_enabled(self):
         return bool(config.emby.enabled) if config.emby else True

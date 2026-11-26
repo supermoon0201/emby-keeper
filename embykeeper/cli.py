@@ -403,23 +403,6 @@ async def main(
         if not await config.reload_conf(config_file):
             raise typer.Exit(1)
 
-    if api:
-        logger.info(f"启动 API 服务器模式, 监听 {api_host}:{api_port}")
-        import uvicorn
-        from .api import create_app
-
-        app = create_app()
-        config_obj = uvicorn.Config(
-            app,
-            host=api_host,
-            port=api_port,
-            access_log=verbosity >= 1,
-            log_config=None,
-        )
-        server = uvicorn.Server(config_obj)
-        await server.serve()
-        return
-
     if verbosity >= 2:
         config.nofail = False
     if not config.nofail:
@@ -776,13 +759,45 @@ async def main(
                 pool.add(subsonic_man.run_all(instant=True), "Subsonic 保活")
             await pool.wait()
             logger.debug("启动时立刻执行签到和保活: 已完成.")
+        api_server = None
+        api_task = None
+        notifier_task = None
         if (not once) or config.noexit:
             from .notify import start_notifier
 
-            streams = await start_notifier()
+            if api:
+                # 面板模式下异步初始化通知器，避免慢速通知初始化阻塞 API 端口就绪
+                async def _start_notifier_bg():
+                    nonlocal streams
+                    try:
+                        streams = await start_notifier()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.warning("初始化消息通知时出错, 后台任务将继续运行.")
+                        show_exception(e, regular=False)
+
+                notifier_task = asyncio.create_task(_start_notifier_bg(), name="消息通知初始化")
+            else:
+                streams = await start_notifier()
         if not once:
             start_telegram_runtime_tasks()
             start_media_runtime_tasks()
+        if api:
+            logger.info(f"启动 API 服务器模式, 监听 {api_host}:{api_port}")
+            import uvicorn
+            from .api import create_app
+
+            api_app = create_app()
+            config_obj = uvicorn.Config(
+                api_app,
+                host=api_host,
+                port=api_port,
+                access_log=verbosity >= 1,
+                log_config=None,
+            )
+            api_server = uvicorn.Server(config_obj)
+            api_task = pool.add(api_server.serve(), "API 服务器")
         if config.noexit:
             logger.info("处于长期监控模式, 当没有账号时将继续监控等待新配置.")
             pool.add(asyncio.Event().wait(), "账号配置文件监控")
@@ -795,11 +810,29 @@ async def main(
                 except Exception as e:
                     logger.debug(f"任务 {t.get_name()} 出现错误, 模块可能停止运行.")
                     show_exception(e, regular=False)
-                    if not config.nofail:
+                    if (not config.nofail) or (api_task is not None and t is api_task):
                         raise
                 else:
                     logger.debug(f"任务 {t.get_name()} 成功结束.")
+                if api_task is not None and t is api_task:
+                    logger.debug("API 服务器已停止, 正在退出后台计划任务.")
+                    break
         finally:
+            if api_server is not None and not api_server.should_exit:
+                api_server.should_exit = True
+            if notifier_task and not notifier_task.done():
+                notifier_task.cancel()
+                await asyncio.gather(notifier_task, return_exceptions=True)
+            await cancel_runtime_tasks(telegram_runtime_tasks, list(telegram_runtime_tasks.keys()))
+            await cancel_runtime_tasks(media_runtime_tasks, list(media_runtime_tasks.keys()))
+            for manager in (checkin_man, register_man, monitor_man, message_man, emby_man, subsonic_man):
+                if manager and hasattr(manager, "stop_all"):
+                    manager.stop_all()
+            pending_pool_tasks = [t for t in list(getattr(pool, "tasks", [])) if not t.done()]
+            for remaining in pending_pool_tasks:
+                remaining.cancel()
+            if pending_pool_tasks:
+                await asyncio.gather(*pending_pool_tasks, return_exceptions=True)
             if streams:
                 from .notify import _stop_notifier
 
