@@ -652,7 +652,8 @@ class Emby:
             return None
 
         if resp.status_code != 200:
-            self.log.warning(f"登陆时出现错误 ({resp.status_code}), 执行失败.")
+            desc = self._describe_response(resp)
+            self.log.warning(f"登陆时出现错误 ({resp.status_code}, {desc}), 执行失败.")
             return None
 
         user: dict = resp.json()

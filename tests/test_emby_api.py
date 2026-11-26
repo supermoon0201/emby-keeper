@@ -1367,3 +1367,27 @@ def test_play_requests_additional_parts_with_discard_body(monkeypatch):
 
     assert asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=20)) is True
     assert additional_parts_kwargs.get("_discard_body") is True
+
+def test_login_non_200_logs_response_details(monkeypatch):
+    emby = build_emby()
+    warnings = []
+
+    async def fake_request(method, path, **kwargs):
+        assert method == "POST"
+        assert path == "/Users/AuthenticateByName"
+        assert kwargs.get("_login") is True
+        return FakeResponse(
+            status_code=403,
+            ok=False,
+            text="<html><body>403 Forbidden by nginx</body></html>",
+        )
+
+    monkeypatch.setattr(emby, "_request", fake_request)
+    monkeypatch.setattr(emby, "log", type("Log", (), {"warning": lambda self, msg: warnings.append(msg)})())
+
+    result = asyncio.run(emby.login())
+
+    assert result is None
+    assert len(warnings) == 1
+    assert "403" in warnings[0]
+    assert "403 Forbidden by nginx" in warnings[0]
