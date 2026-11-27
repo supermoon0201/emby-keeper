@@ -206,6 +206,21 @@ def test_build_headers_uses_logged_in_user_id_for_emby_authorization():
     assert "Emby UserId=RUN-ID" not in headers["X-Emby-Authorization"]
 
 
+@pytest.mark.parametrize("token", [None, "test-token"])
+def test_jellyfin_uses_mediabrowser_authorization_for_login_and_api_calls(monkeypatch, token):
+    emby = build_emby()
+    emby.a.jellyfin = True
+    emby._token = token
+    monkeypatch.setattr(emby, "_load_credentials", lambda: None)
+
+    headers = emby.build_headers()
+
+    assert headers["Authorization"].startswith('MediaBrowser Client="Fileball", Device="Test%20Device",')
+    assert ('Token="test-token"' in headers["Authorization"]) == bool(token)
+    assert "X-Emby-Authorization" not in headers
+    assert "X-Emby-Token" not in headers
+
+
 def test_request_preserves_base_path_in_account_url(monkeypatch):
     emby = Emby(
         EmbyAccount(
@@ -1109,7 +1124,8 @@ def test_play_tolerates_brief_stream_reconnect_errors(monkeypatch):
     assert stream_attempts["count"] >= 2
 
 
-def test_play_uses_external_headers_for_absolute_direct_stream_url(monkeypatch):
+@pytest.mark.parametrize("jellyfin, same_origin", [(False, False), (True, False), (True, True)])
+def test_play_selects_direct_stream_headers_by_origin(monkeypatch, jellyfin, same_origin):
     emby = Emby(
         EmbyAccount(
             url="https://gy.emby.yun:4443",
@@ -1118,12 +1134,18 @@ def test_play_uses_external_headers_for_absolute_direct_stream_url(monkeypatch):
             use_proxy=False,
             external_stream_workaround=True,
             useragent="SenPlayer/5.8.7",
+            jellyfin=jellyfin,
         )
     )
     emby._token = "token"
     emby._user_id = "user-id"
     emby._stream_max_bytes_per_request = 1024 * 1024
     emby._stream_max_request_seconds = 10
+    stream_url = (
+        "https://gy.emby.yun:4443/Videos/item-id/stream"
+        if same_origin
+        else "http://110.42.42.172:35902/emby/Videos/754409/stream?Static=true&api_key=token"
+    )
 
     captured_headers = []
     original_sleep = asyncio.sleep
@@ -1132,11 +1154,6 @@ def test_play_uses_external_headers_for_absolute_direct_stream_url(monkeypatch):
         def __init__(self):
             self.status_code = 200
             self.headers = {}
-            self.request = type(
-                "Request",
-                (),
-                {"url": "http://110.42.42.172:35902/emby/Videos/754409/stream?Static=true&api_key=token"},
-            )()
 
         async def aiter_bytes(self, chunk_size=1024):
             yield b"x"
@@ -1171,7 +1188,7 @@ def test_play_uses_external_headers_for_absolute_direct_stream_url(monkeypatch):
                     "MediaSources": [
                         {
                             "Id": "media-source",
-                            "DirectStreamUrl": "http://110.42.42.172:35902/emby/Videos/754409/stream?Static=true&api_key=token",
+                            "DirectStreamUrl": stream_url,
                         }
                     ],
                 }
@@ -1188,9 +1205,13 @@ def test_play_uses_external_headers_for_absolute_direct_stream_url(monkeypatch):
 
     assert asyncio.run(emby.play({"Id": "item-id", "Name": "Demo"}, time=20)) is True
     assert captured_headers
-    assert captured_headers[0]["Accept"] == "*/*"
-    assert captured_headers[0]["Connection"] == "close"
     assert captured_headers[0]["Range"] == "bytes=0-"
+    if same_origin:
+        assert 'Token="token"' in captured_headers[0]["Authorization"]
+    else:
+        assert captured_headers[0]["Accept"] == "*/*"
+        assert captured_headers[0]["Connection"] == "close"
+        assert "Authorization" not in captured_headers[0]
 
 
 def test_watch_marks_item_played_when_server_does_not_increment_play_count(monkeypatch):

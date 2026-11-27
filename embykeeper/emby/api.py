@@ -296,20 +296,29 @@ class Emby:
         return env
 
     def build_headers(self):
-        headers = {}
+        headers = {
+            "User-Agent": self.useragent or self.env.useragent,
+            "Accept-Language": "zh-CN,zh-Hans;q=0.9",
+            "Content-Type": "application/json",
+            "Accept": "*/*",
+        }
         auth_headers = {
             "Client": self.env.client,
             "Device": self.env.device,
             "DeviceId": self.env.device_id,
             "Version": self.env.client_version,
         }
+        if self.a.jellyfin:
+            # Jellyfin 12 使用标准 Authorization 请求头，登录前只发送客户端信息。
+            if self.token:
+                auth_headers["Token"] = self.token
+            fields = ", ".join(f'{key}="{quote(str(value), safe="")}"' for key, value in auth_headers.items())
+            headers["Authorization"] = f"MediaBrowser {fields}"
+            return headers
+
         auth_header = ",".join([f"{k}={quote(str(v))}" for k, v in auth_headers.items()])
         auth_user_id = self.user_id or self.run_id
         full_auth_header = f'MediaBrowser Token={self.token or ""},Emby UserId={auth_user_id},{auth_header}'
-        headers["User-Agent"] = self.useragent or self.env.useragent
-        headers["Accept-Language"] = "zh-CN,zh-Hans;q=0.9"
-        headers["Content-Type"] = "application/json"
-        headers["Accept"] = "*/*"
         headers["X-Emby-Authorization"] = full_auth_header
         if self.token:
             headers["X-Emby-Token"] = self.token
@@ -893,6 +902,8 @@ class Emby:
                             max_bytes_per_request = min(max_bytes_per_request, 2 * 1024 * 1024)
                             max_request_seconds = min(max_request_seconds, 5)
                         stream_headers = self._build_external_stream_headers(length)
+                    elif self.a.jellyfin and urlparse(stream_url).scheme == self.a.url.scheme:
+                        stream_headers["Authorization"] = self.build_headers()["Authorization"]
                 response = None
                 response_cm = None
                 client = None
@@ -918,7 +929,9 @@ class Emby:
                             raise EmbyStatusError("访问失败: 流媒体重定向缺少目标地址")
                         parsed_redirect = urlparse(redirect_url)
                         redirect_headers = stream_headers
-                        if parsed_redirect.netloc and parsed_redirect.netloc != parsed_original.netloc:
+                        redirected_host = parsed_redirect.netloc not in ("", parsed_original.netloc)
+                        redirected_scheme = parsed_redirect.scheme not in ("", parsed_original.scheme)
+                        if redirected_host or (self.a.jellyfin and redirected_scheme):
                             if self.use_external_stream_workaround:
                                 max_bytes_per_request = min(max_bytes_per_request, 256 * 1024)
                                 max_request_seconds = min(max_request_seconds, 2)

@@ -513,7 +513,13 @@ async def update_emby_account(key: str = Query(...), payload: EmbyAccountPayload
                 payload_data = payload.model_dump(exclude_none=True)
                 if not payload_data.get('password'):
                     payload_data['password'] = account.password
-                next_account = EmbyAccount(id=_account_key(account), **payload_data)
+                # 保留表单未管理的配置项，例如单账号超时和设备参数。
+                unmanaged_fields = account.model_dump(
+                    exclude_none=True,
+                    exclude_unset=True,
+                    exclude=set(EmbyAccountPayload.model_fields) | {"id"},
+                )
+                next_account = EmbyAccount(id=_account_key(account), **unmanaged_fields, **payload_data)
                 next_accounts.append(next_account)
                 updated = True
             else:
